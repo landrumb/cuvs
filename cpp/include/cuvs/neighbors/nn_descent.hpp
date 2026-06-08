@@ -188,6 +188,18 @@ struct index : cuvs::neighbors::index {
     return distances_view_;
   }
 
+  /** Number of NN-descent iterations executed during the last build. */
+  [[nodiscard]] constexpr inline auto num_iterations_executed() const noexcept -> size_t
+  {
+    return num_iterations_executed_;
+  }
+
+  /** @private */
+  void set_num_iterations_executed(size_t num_iterations) noexcept
+  {
+    num_iterations_executed_ = num_iterations;
+  }
+
   // Don't allow copying the index for performance reasons (try avoiding copying data)
   index(const index&)                    = delete;
   index(index&&)                         = default;
@@ -204,6 +216,7 @@ struct index : cuvs::neighbors::index {
     graph_view_;  // view of graph for user provided matrix
   std::optional<raft::device_matrix_view<float, int64_t, row_major>> distances_view_;
   bool return_distances_;
+  size_t num_iterations_executed_{0};
 };
 
 /** @} */

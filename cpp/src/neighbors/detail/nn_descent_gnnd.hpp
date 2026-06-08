@@ -178,6 +178,7 @@ struct CUVS_EXPORT GnndGraph {
             const size_t internal_node_degree,
             const size_t num_samples);
   void init_random_graph();
+  void init_distance_list_to_max();
   // TODO: Create a generic bloom filter utility https://github.com/rapidsai/raft/issues/1827
   // Use Bloom filter to sample "new" neighbors for local joining
   void sample_graph_new(InternalID_t<Index_t>* new_neighbors, const size_t width);
@@ -204,7 +205,12 @@ class CUVS_EXPORT GNND {
              Index_t* output_graph,
              bool return_distances,
              DistData_t* output_distances,
-             DistEpilogue_t dist_epilogue = DistEpilogue_t{});
+             DistEpilogue_t dist_epilogue     = DistEpilogue_t{},
+             bool use_initial_graph           = false);
+  [[nodiscard]] size_t num_iterations_executed() const noexcept
+  {
+    return num_iterations_executed_;
+  }
   ~GNND()    = default;
   using ID_t = InternalID_t<Index_t>;
   void reset(raft::resources const& res);
@@ -224,6 +230,7 @@ class CUVS_EXPORT GNND {
   BuildConfig build_config_;
   GnndGraph<Index_t> graph_;
   std::atomic<int64_t> update_counter_;
+  size_t num_iterations_executed_{0};
 
   size_t nrow_;
   size_t ndim_;

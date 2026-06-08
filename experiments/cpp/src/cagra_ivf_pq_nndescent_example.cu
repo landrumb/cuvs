@@ -24,6 +24,7 @@
 
 #include <cuvs/neighbors/brute_force.hpp>
 #include <cuvs/neighbors/cagra.hpp>
+#include <cuvs/neighbors/nn_descent.hpp>
 
 #include <rmm/mr/pool_memory_resource.hpp>
 
@@ -81,6 +82,8 @@ void usage(char const* program)
 {
   std::cout << "Usage: " << program
             << " [--search-recall] [base.fbin query.fbin [max_rows] [max_queries]]\n\n"
+            << "Builds a CAGRA index using a two-stage kNN graph pipeline: IVF-PQ candidate "
+               "generation, then NN-descent refinement initialized from those candidates.\n"
             << "With no arguments, this example looks for the built-in cuVS Bench descriptor "
                "layout for sift-128-euclidean under RAPIDS_DATASET_ROOT_DIR or datasets/.\n"
             << "If those files are not present, it falls back to a larger synthetic dataset.\n"
@@ -279,10 +282,10 @@ void evaluate_search_recall(raft::device_resources const& dev_resources,
 
 }  // namespace
 
-void cagra_build_search_simple(raft::device_resources const& dev_resources,
-                               raft::device_matrix_view<const float, int64_t> dataset,
-                               raft::device_matrix_view<const float, int64_t> queries,
-                               bool report_search_recall)
+void cagra_ivf_pq_nndescent_build_search(raft::device_resources const& dev_resources,
+                                         raft::device_matrix_view<const float, int64_t> dataset,
+                                         raft::device_matrix_view<const float, int64_t> queries,
+                                         bool report_search_recall)
 {
   using namespace cuvs::neighbors;
 
@@ -295,10 +298,54 @@ void cagra_build_search_simple(raft::device_resources const& dev_resources,
 
   // use default index parameters
   cagra::index_params index_params;
+  auto const intermediate_degree = index_params.intermediate_graph_degree;
+  auto const graph_degree        = index_params.graph_degree;
 
-  std::cout << "Building CAGRA index (search graph)" << std::endl;
   auto build_start = clock_type::now();
-  auto index       = cagra::build(dev_resources, index_params, dataset);
+
+  std::cout << "Building kNN graph with IVF-PQ (candidate generation)" << std::endl;
+  auto ivf_pq_start = clock_type::now();
+  auto ivf_pq_params =
+    cagra::graph_build_params::ivf_pq_params(dataset.extents(), index_params.metric);
+  auto knn_graph =
+    raft::make_host_matrix<uint32_t, int64_t>(dataset.extent(0), intermediate_degree);
+
+  auto dataset_host =
+    raft::make_host_matrix<float, int64_t>(dataset.extent(0), dataset.extent(1));
+  auto stream = raft::resource::get_cuda_stream(dev_resources);
+  raft::copy(
+    dataset_host.data_handle(), dataset.data_handle(), dataset.size(), stream);
+  raft::resource::sync_stream(dev_resources);
+
+  cagra::build_knn_graph(
+    dev_resources, dataset_host.view(), knn_graph.view(), ivf_pq_params);
+  raft::resource::sync_stream(dev_resources);
+  std::cout << "IVF-PQ candidate graph built in " << elapsed_seconds(ivf_pq_start) << " s"
+            << std::endl;
+
+  std::cout << "Refining kNN graph with NN-descent (initialized from IVF-PQ candidates)"
+            << std::endl;
+  auto nndescent_start = clock_type::now();
+  auto nn_descent_params =
+    cagra::graph_build_params::nn_descent_params(intermediate_degree, index_params.metric);
+  nn_descent_params.return_distances = false;
+  (void)nn_descent::build(
+    dev_resources, nn_descent_params, dataset, std::make_optional(knn_graph.view()));
+  raft::resource::sync_stream(dev_resources);
+  std::cout << "NN-descent refinement completed in " << elapsed_seconds(nndescent_start) << " s"
+            << std::endl;
+
+  std::cout << "Optimizing kNN graph to CAGRA graph (degree=" << graph_degree << ")" << std::endl;
+  auto optimize_start = clock_type::now();
+  auto cagra_graph =
+    raft::make_host_matrix<uint32_t, int64_t>(dataset.extent(0), graph_degree);
+  cagra::helpers::optimize(dev_resources, knn_graph.view(), cagra_graph.view());
+  raft::resource::sync_stream(dev_resources);
+  std::cout << "Graph optimized in " << elapsed_seconds(optimize_start) << " s" << std::endl;
+
+  std::cout << "Building CAGRA index from optimized graph" << std::endl;
+  auto index = cagra::index<float, uint32_t>(
+    dev_resources, index_params.metric, dataset, raft::make_const_mdspan(cagra_graph.view()));
   raft::resource::sync_stream(dev_resources);
 
   std::cout << "Built CAGRA index in " << elapsed_seconds(build_start) << " s" << std::endl;
@@ -370,7 +417,7 @@ int main(int argc, char* argv[])
     std::cout << "Loaded dataset and queries in " << elapsed_seconds(load_start) << " s"
               << std::endl;
 
-    cagra_build_search_simple(dev_resources,
+    cagra_ivf_pq_nndescent_build_search(dev_resources,
                               raft::make_const_mdspan(dataset.view()),
                               raft::make_const_mdspan(queries.view()),
                               options.search_recall);
@@ -389,7 +436,7 @@ int main(int argc, char* argv[])
     std::cout << "Loaded dataset and queries in " << elapsed_seconds(load_start) << " s"
               << std::endl;
 
-    cagra_build_search_simple(dev_resources,
+    cagra_ivf_pq_nndescent_build_search(dev_resources,
                               raft::make_const_mdspan(dataset.view()),
                               raft::make_const_mdspan(queries.view()),
                               options.search_recall);
@@ -408,8 +455,8 @@ int main(int argc, char* argv[])
   std::cout << "Generated synthetic dataset and queries in " << elapsed_seconds(generate_start)
             << " s" << std::endl;
 
-  cagra_build_search_simple(dev_resources,
-                            raft::make_const_mdspan(dataset.view()),
-                            raft::make_const_mdspan(queries.view()),
-                            options.search_recall);
+  cagra_ivf_pq_nndescent_build_search(dev_resources,
+                                      raft::make_const_mdspan(dataset.view()),
+                                      raft::make_const_mdspan(queries.view()),
+                                      options.search_recall);
 }

@@ -1199,6 +1199,18 @@ void GnndGraph<Index_t>::sample_graph_new(InternalID_t<Index_t>* new_neighbors, 
 }
 
 template <typename Index_t>
+void GnndGraph<Index_t>::init_distance_list_to_max()
+{
+#pragma omp parallel for
+  for (size_t i = 0; i < nrow; i++) {
+    auto h_dist_list = h_dists.data_handle() + i * node_degree;
+    for (size_t j = 0; j < static_cast<size_t>(node_degree); j++) {
+      h_dist_list[j] = std::numeric_limits<DistData_t>::max();
+    }
+  }
+}
+
+template <typename Index_t>
 void GnndGraph<Index_t>::init_random_graph()
 {
   for (size_t seg_idx = 0; seg_idx < static_cast<size_t>(num_segments); seg_idx++) {
@@ -1488,7 +1500,8 @@ void GNND<Data_t, Index_t>::build(Data_t* data,
                                   Index_t* output_graph,
                                   bool return_distances,
                                   DistData_t* output_distances,
-                                  DistEpilogue_t dist_epilogue)
+                                  DistEpilogue_t dist_epilogue,
+                                  bool use_initial_graph)
 {
   using input_t = typename std::remove_const<Data_t>::type;
 
@@ -1596,8 +1609,13 @@ void GNND<Data_t, Index_t>::build(Data_t* data,
   }
 
   graph_.clear();
-  graph_.init_random_graph();
+  if (!use_initial_graph) {
+    graph_.init_random_graph();
+  } else {
+    graph_.init_distance_list_to_max();
+  }
   graph_.sample_graph(true);
+  num_iterations_executed_ = 0;
 
   auto update_and_sample = [&](bool update_graph) {
     if (update_graph) {
@@ -1615,6 +1633,7 @@ void GNND<Data_t, Index_t>::build(Data_t* data,
   };
 
   for (size_t it = 0; it < build_config_.max_iterations; it++) {
+    num_iterations_executed_ = it + 1;
     raft::copy(res, d_list_sizes_new_.view(), graph_.h_list_sizes_new.view());
     raft::copy(res, h_graph_old_.view(), graph_.h_graph_old.view());
     raft::copy(res, d_list_sizes_old_.view(), graph_.h_list_sizes_old.view());
@@ -1743,7 +1762,8 @@ template <typename T,
 void build(raft::resources const& res,
            const index_params& params,
            raft::mdspan<const T, raft::matrix_extent<int64_t>, raft::row_major, Accessor> dataset,
-           index<IdxT>& idx)
+           index<IdxT>& idx,
+           bool has_initial_graph = false)
 {
   size_t extended_graph_degree, graph_degree;
   auto build_config = get_build_config(res,
@@ -1757,6 +1777,22 @@ void build(raft::resources const& res,
   auto int_graph =
     raft::make_host_matrix<int, int64_t, raft::row_major>(dataset.extent(0), extended_graph_degree);
 
+  if (has_initial_graph) {
+    auto const user_graph = idx.graph();
+    RAFT_EXPECTS(user_graph.extent(1) == static_cast<int64_t>(graph_degree),
+                 "Initial NN-descent graph degree must match index_params.graph_degree");
+#pragma omp parallel for
+    for (int64_t i = 0; i < user_graph.extent(0); ++i) {
+      for (size_t j = 0; j < extended_graph_degree; ++j) {
+        if (j < graph_degree) {
+          int_graph(i, j) = static_cast<int>(user_graph(i, static_cast<int64_t>(j)));
+        } else {
+          int_graph(i, j) = std::numeric_limits<int>::max();
+        }
+      }
+    }
+  }
+
   GNND<const T, int> nnd(res, build_config);
 
   if (idx.distances().has_value() || !params.return_distances) {
@@ -1766,7 +1802,10 @@ void build(raft::resources const& res,
               params.return_distances,
               idx.distances()
                 .value_or(raft::make_device_matrix<float, int64_t>(res, 0, 0).view())
-                .data_handle());
+                .data_handle(),
+              raft::identity_op{},
+              has_initial_graph);
+    idx.set_num_iterations_executed(nnd.num_iterations_executed());
   } else {
     RAFT_EXPECTS(!params.return_distances,
                  "Distance view not allocated. Using return_distances set to true requires "

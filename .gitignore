@@ -88,3 +88,6 @@ ivf_pq_index
 
 # java
 .classpath
+
+# machine-specific devcontainer overrides
+.devcontainer/local-cuda13.2-conda/

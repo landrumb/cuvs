@@ -97,9 +97,10 @@ template <typename T, typename IdxT = uint32_t>
 void build(raft::resources const& res,
            index_params const& params,
            raft::device_matrix_view<const T, int64_t, raft::row_major> dataset,
-           index<IdxT>& idx)
+           index<IdxT>& idx,
+           bool has_initial_graph = false)
 {
-  detail::build<T, IdxT>(res, params, dataset, idx);
+  detail::build<T, IdxT>(res, params, dataset, idx, has_initial_graph);
 }
 
 /**
@@ -179,9 +180,10 @@ template <typename T, typename IdxT = uint32_t>
 void build(raft::resources const& res,
            index_params const& params,
            raft::host_matrix_view<const T, int64_t, raft::row_major> dataset,
-           index<IdxT>& idx)
+           index<IdxT>& idx,
+           bool has_initial_graph = false)
 {
-  detail::build<T, IdxT>(res, params, dataset, idx);
+  detail::build<T, IdxT>(res, params, dataset, idx, has_initial_graph);
 }
 
 /** @} */  // end group nn-descent

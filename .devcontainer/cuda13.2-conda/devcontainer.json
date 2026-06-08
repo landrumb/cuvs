@@ -1,4 +1,5 @@
 {
+  "name": "cuVS cuda13.2-conda (local host mounts)",
   "build": {
     "context": "${localWorkspaceFolder}/.devcontainer",
     "dockerfile": "${localWorkspaceFolder}/.devcontainer/Dockerfile",
@@ -14,7 +15,7 @@
   "runArgs": [
     "--rm",
     "--name",
-    "${localEnv:USER:anon}-rapids-${localWorkspaceFolderBasename}-26.08-cuda13.2-conda",
+    "${localEnv:USER:anon}-rapids-${localWorkspaceFolderBasename}-26.08-cuda13.2-conda-local",
     "--ulimit",
     "nofile=500000"
   ],
@@ -25,7 +26,7 @@
   "overrideFeatureInstallOrder": [
     "ghcr.io/rapidsai/devcontainers/features/rapids-build-utils"
   ],
-  "initializeCommand": ["/bin/bash", "-c", "mkdir -m 0755 -p ${localWorkspaceFolder}/../.{aws,cache,config,conda/pkgs,conda/${localWorkspaceFolderBasename}-cuda13.2-envs}"],
+  "initializeCommand": ["/bin/bash", "-c", "mkdir -m 0755 -p ${localWorkspaceFolder}/../.{aws,cache,config,conda/pkgs,conda/${localWorkspaceFolderBasename}-cuda13.2-envs} /raid/blandrum/local_datasets"],
   "postAttachCommand": ["/bin/bash", "-c", "if [ ${CODESPACES:-false} = 'true' ]; then . devcontainer-utils-post-attach-command; . rapids-post-attach-command; fi"],
   "workspaceFolder": "/home/coder",
   "workspaceMount": "source=${localWorkspaceFolder},target=/home/coder/cuvs,type=bind,consistency=consistent",
@@ -34,8 +35,12 @@
     "source=${localWorkspaceFolder}/../.cache,target=/home/coder/.cache,type=bind,consistency=consistent",
     "source=${localWorkspaceFolder}/../.config,target=/home/coder/.config,type=bind,consistency=consistent",
     "source=${localWorkspaceFolder}/../.conda/pkgs,target=/home/coder/.conda/pkgs,type=bind,consistency=consistent",
-    "source=${localWorkspaceFolder}/../.conda/${localWorkspaceFolderBasename}-cuda13.2-envs,target=/home/coder/.conda/envs,type=bind,consistency=consistent"
+    "source=${localWorkspaceFolder}/../.conda/${localWorkspaceFolderBasename}-cuda13.2-envs,target=/home/coder/.conda/envs,type=bind,consistency=consistent",
+    "source=/raid,target=/raid,type=bind,consistency=consistent"
   ],
+  "containerEnv": {
+    "RAPIDS_DATASET_ROOT_DIR": "/raid/blandrum/local_datasets"
+  },
   "customizations": {
     "vscode": {
       "extensions": [

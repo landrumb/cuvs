@@ -24,6 +24,19 @@ ENV DEFAULT_CONDA_ENV=rapids
 
 FROM ${PYTHON_PACKAGE_MANAGER}-base
 
+RUN . /etc/lsb-release \
+ && apt update -y \
+ && DEBIAN_FRONTEND=noninteractive apt install -y --no-install-recommends \
+    iputils-ping \
+    gnupg \
+    software-properties-common \
+ && apt-key adv --fetch-keys https://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/x86_64/7fa2af80.pub \
+ && add-apt-repository -y "deb https://developer.download.nvidia.com/devtools/repos/ubuntu$(echo "$DISTRIB_RELEASE" | tr -d .)/$(dpkg --print-architecture)/ /" \
+ && apt update -y \
+ && DEBIAN_FRONTEND=noninteractive apt install -y --no-install-recommends \
+    nsight-systems \
+ && rm -rf /tmp/* /var/tmp/* /var/cache/apt/* /var/lib/apt/lists/*;
+
 ARG TARGETARCH
 
 ARG CUDA

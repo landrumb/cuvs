@@ -30,7 +30,7 @@ auto build(raft::resources const& handle,
       std::nullopt;
     cuvs::neighbors::nn_descent::index<index_t> idx{
       handle, graph.value(), distances, params.metric};
-    cuvs::neighbors::nn_descent::build<data_t, index_t>(handle, params, dataset, idx);
+    cuvs::neighbors::nn_descent::build<data_t, index_t>(handle, params, dataset, idx, true);
     return idx;
   };
 }
@@ -47,7 +47,7 @@ auto build(raft::resources const& handle,
       std::nullopt;
     cuvs::neighbors::nn_descent::index<index_t> idx{
       handle, graph.value(), distances, params.metric};
-    cuvs::neighbors::nn_descent::build<data_t, index_t>(handle, params, dataset, idx);
+    cuvs::neighbors::nn_descent::build<data_t, index_t>(handle, params, dataset, idx, true);
     return idx;
   }
 };

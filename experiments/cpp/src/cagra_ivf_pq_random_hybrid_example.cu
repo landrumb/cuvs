@@ -24,6 +24,7 @@
 
 #include <cuvs/neighbors/brute_force.hpp>
 #include <cuvs/neighbors/cagra.hpp>
+#include <cuvs/neighbors/nn_descent.hpp>
 
 #include <rmm/mr/pool_memory_resource.hpp>
 
@@ -39,6 +40,9 @@ constexpr int64_t kSyntheticQueries = 100;
 constexpr int kDefaultMaxRows       = 100000;
 constexpr int kDefaultMaxQueries    = 1000;
 constexpr int64_t kMaxGraphRecallNodes = 4096;
+constexpr size_t kIvfPqSeedDegree      = 64;
+constexpr size_t kRandomSeedDegree        = 64;
+constexpr size_t kNnDescentSegmentSize    = 32;
 
 struct dataset_paths {
   std::filesystem::path base;
@@ -77,10 +81,55 @@ struct example_options {
   std::vector<std::string> positional;
 };
 
+void fill_nn_descent_style_random_neighbors(raft::host_matrix_view<uint32_t, int64_t> graph,
+                                          size_t col_offset,
+                                          size_t degree)
+{
+  int64_t const nrow         = graph.extent(0);
+  size_t const num_segments  = degree / kNnDescentSegmentSize;
+  int64_t const row_degree   = graph.extent(1);
+
+  for (size_t seg_idx = 0; seg_idx < num_segments; ++seg_idx) {
+    std::vector<uint32_t> rand_seq((nrow + static_cast<int64_t>(num_segments) - 1) /
+                                   static_cast<int64_t>(num_segments));
+    std::iota(rand_seq.begin(), rand_seq.end(), uint32_t{0});
+    auto gen = std::default_random_engine{seg_idx};
+    std::shuffle(rand_seq.begin(), rand_seq.end(), gen);
+
+    for (int64_t i = 0; i < nrow; ++i) {
+      size_t idx = static_cast<size_t>(i * row_degree + col_offset + seg_idx * kNnDescentSegmentSize);
+      size_t self_in_this_seg = 0;
+      for (size_t j = 0; j < kNnDescentSegmentSize; ++j) {
+        uint32_t id = rand_seq[idx % rand_seq.size()] * static_cast<uint32_t>(num_segments) +
+                      static_cast<uint32_t>(seg_idx);
+        if (static_cast<int64_t>(id) == i) {
+          ++idx;
+          id = rand_seq[idx % rand_seq.size()] * static_cast<uint32_t>(num_segments) +
+               static_cast<uint32_t>(seg_idx);
+          self_in_this_seg = 1;
+        }
+
+        int64_t const out_col =
+          static_cast<int64_t>(col_offset + seg_idx * kNnDescentSegmentSize + j);
+        graph(i, out_col) =
+          j < (rand_seq.size() - self_in_this_seg) && static_cast<int64_t>(id) < nrow
+            ? id
+            : std::numeric_limits<uint32_t>::max();
+        ++idx;
+      }
+    }
+  }
+}
+
 void usage(char const* program)
 {
   std::cout << "Usage: " << program
             << " [--search-recall] [base.fbin query.fbin [max_rows] [max_queries]]\n\n"
+            << "Builds a CAGRA index using a hybrid NN-descent seed: the first "
+            << kIvfPqSeedDegree
+            << " neighbors come from IVF-PQ candidate generation and the next "
+            << kRandomSeedDegree
+            << " neighbors use the same random initialization as standard NN-descent.\n"
             << "With no arguments, this example looks for the built-in cuVS Bench descriptor "
                "layout for sift-128-euclidean under RAPIDS_DATASET_ROOT_DIR or datasets/.\n"
             << "If those files are not present, it falls back to a larger synthetic dataset.\n"
@@ -279,10 +328,10 @@ void evaluate_search_recall(raft::device_resources const& dev_resources,
 
 }  // namespace
 
-void cagra_build_search_simple(raft::device_resources const& dev_resources,
-                               raft::device_matrix_view<const float, int64_t> dataset,
-                               raft::device_matrix_view<const float, int64_t> queries,
-                               bool report_search_recall)
+void cagra_ivf_pq_random_hybrid_build_search(raft::device_resources const& dev_resources,
+                                             raft::device_matrix_view<const float, int64_t> dataset,
+                                             raft::device_matrix_view<const float, int64_t> queries,
+                                             bool report_search_recall)
 {
   using namespace cuvs::neighbors;
 
@@ -295,10 +344,67 @@ void cagra_build_search_simple(raft::device_resources const& dev_resources,
 
   // use default index parameters
   cagra::index_params index_params;
+  auto const intermediate_degree = index_params.intermediate_graph_degree;
+  auto const graph_degree        = index_params.graph_degree;
+  RAFT_EXPECTS(intermediate_degree == kIvfPqSeedDegree + kRandomSeedDegree,
+                "This example expects intermediate_graph_degree=%zu (got %zu)",
+                kIvfPqSeedDegree + kRandomSeedDegree,
+                intermediate_degree);
 
-  std::cout << "Building CAGRA index (search graph)" << std::endl;
   auto build_start = clock_type::now();
-  auto index       = cagra::build(dev_resources, index_params, dataset);
+
+  auto dataset_host =
+    raft::make_host_matrix<float, int64_t>(dataset.extent(0), dataset.extent(1));
+  auto stream = raft::resource::get_cuda_stream(dev_resources);
+  raft::copy(dataset_host.data_handle(), dataset.data_handle(), dataset.size(), stream);
+  raft::resource::sync_stream(dev_resources);
+
+  std::cout << "Building IVF-PQ seed graph (" << kIvfPqSeedDegree << " neighbors)" << std::endl;
+  auto ivf_pq_start = clock_type::now();
+  auto ivf_pq_params =
+    cagra::graph_build_params::ivf_pq_params(dataset.extents(), index_params.metric);
+  auto ivf_pq_seed_graph =
+    raft::make_host_matrix<uint32_t, int64_t>(dataset.extent(0), kIvfPqSeedDegree);
+  cagra::build_knn_graph(
+    dev_resources, dataset_host.view(), ivf_pq_seed_graph.view(), ivf_pq_params);
+  raft::resource::sync_stream(dev_resources);
+  std::cout << "IVF-PQ seed graph built in " << elapsed_seconds(ivf_pq_start) << " s" << std::endl;
+
+  std::cout << "Building hybrid NN-descent seed (" << kIvfPqSeedDegree << " IVF-PQ + "
+            << kRandomSeedDegree << " random)" << std::endl;
+  auto seed_start = clock_type::now();
+  auto knn_graph =
+    raft::make_host_matrix<uint32_t, int64_t>(dataset.extent(0), intermediate_degree);
+  for (int64_t row = 0; row < dataset.extent(0); ++row) {
+    for (size_t col = 0; col < kIvfPqSeedDegree; ++col) {
+      knn_graph(row, static_cast<int64_t>(col)) = ivf_pq_seed_graph(row, static_cast<int64_t>(col));
+    }
+  }
+  fill_nn_descent_style_random_neighbors(knn_graph.view(), kIvfPqSeedDegree, kRandomSeedDegree);
+  std::cout << "Hybrid seed graph assembled in " << elapsed_seconds(seed_start) << " s" << std::endl;
+
+  std::cout << "Refining kNN graph with NN-descent (initialized from hybrid seed)" << std::endl;
+  auto nndescent_start = clock_type::now();
+  auto nn_descent_params =
+    cagra::graph_build_params::nn_descent_params(intermediate_degree, index_params.metric);
+  nn_descent_params.return_distances = false;
+  (void)nn_descent::build(
+    dev_resources, nn_descent_params, dataset, std::make_optional(knn_graph.view()));
+  raft::resource::sync_stream(dev_resources);
+  std::cout << "NN-descent refinement completed in " << elapsed_seconds(nndescent_start) << " s"
+            << std::endl;
+
+  std::cout << "Optimizing kNN graph to CAGRA graph (degree=" << graph_degree << ")" << std::endl;
+  auto optimize_start = clock_type::now();
+  auto cagra_graph =
+    raft::make_host_matrix<uint32_t, int64_t>(dataset.extent(0), graph_degree);
+  cagra::helpers::optimize(dev_resources, knn_graph.view(), cagra_graph.view());
+  raft::resource::sync_stream(dev_resources);
+  std::cout << "Graph optimized in " << elapsed_seconds(optimize_start) << " s" << std::endl;
+
+  std::cout << "Building CAGRA index from optimized graph" << std::endl;
+  auto index = cagra::index<float, uint32_t>(
+    dev_resources, index_params.metric, dataset, raft::make_const_mdspan(cagra_graph.view()));
   raft::resource::sync_stream(dev_resources);
 
   std::cout << "Built CAGRA index in " << elapsed_seconds(build_start) << " s" << std::endl;
@@ -370,7 +476,7 @@ int main(int argc, char* argv[])
     std::cout << "Loaded dataset and queries in " << elapsed_seconds(load_start) << " s"
               << std::endl;
 
-    cagra_build_search_simple(dev_resources,
+    cagra_ivf_pq_random_hybrid_build_search(dev_resources,
                               raft::make_const_mdspan(dataset.view()),
                               raft::make_const_mdspan(queries.view()),
                               options.search_recall);
@@ -389,7 +495,7 @@ int main(int argc, char* argv[])
     std::cout << "Loaded dataset and queries in " << elapsed_seconds(load_start) << " s"
               << std::endl;
 
-    cagra_build_search_simple(dev_resources,
+    cagra_ivf_pq_random_hybrid_build_search(dev_resources,
                               raft::make_const_mdspan(dataset.view()),
                               raft::make_const_mdspan(queries.view()),
                               options.search_recall);
@@ -408,8 +514,8 @@ int main(int argc, char* argv[])
   std::cout << "Generated synthetic dataset and queries in " << elapsed_seconds(generate_start)
             << " s" << std::endl;
 
-  cagra_build_search_simple(dev_resources,
-                            raft::make_const_mdspan(dataset.view()),
-                            raft::make_const_mdspan(queries.view()),
-                            options.search_recall);
+  cagra_ivf_pq_random_hybrid_build_search(dev_resources,
+                                          raft::make_const_mdspan(dataset.view()),
+                                          raft::make_const_mdspan(queries.view()),
+                                          options.search_recall);
 }
