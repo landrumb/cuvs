@@ -25,6 +25,8 @@ The harness loads the split partition indexes, builds an initial merged graph fr
 
 CSV output: `/raid/blandrum/split-wiki/merge_construction_results.csv`
 
+For k-way experiments, the harness now discovers sorted `part_*` directories under `--split-dir`. `--part-start` and `--part-count` restrict evaluation to a contiguous subset of parts, and `--groundtruth <neighbors.ibin>` maps source-ID ground truth through `original_ids.ibin` for full-dataset evaluations without running brute force.
+
 Figure: ![Append-k recall and build time](cagra_append_k_recall_build.png)
 
 The build-time subplot uses solid lines for measured end-to-end variant build time and dotted lines for the same rows after subtracting partition graph load.
@@ -129,12 +131,44 @@ These runs add `--skip-optimize` on top of `--skip-nnd`, so the mixed seed graph
 
 No-optimize shows that the cross-query append itself carries most of the quality: append1 reaches `0.965483` recall@12, append8 is already above scratch IVF-PQ (`0.976608` vs `0.974558`), and append16 is effectively tied with optimized append16. At low k, optimize is still worth about `0.004` to `0.006` absolute recall for roughly `0.3` to `0.5 s` extra build time. At k32, no-optimize has the highest recall in this sweep (`0.983792`), but it is searching a degree-96 raw graph and search time rises to `84.193 ms`; the optimized degree-64 rows stay near `60 ms` search time.
 
+## Multi-Way wiki_all_10M Results
+
+10-way split artifacts live at `/raid/blandrum/split-wiki-10m-10way`. The split is seeded random k-way over `wiki_all_10M`, with ten 1M-row parts, graph degree 64, intermediate graph degree 128, and IVF-PQ-built CAGRA graphs for each part. Result rows are copied to `experiments/cpp/merge_construction_results_10way.csv`.
+
+Full 10-way rows below use `--groundtruth /raid/blandrum/local_datasets/wiki_all_10M/groundtruth.10M.neighbors.ibin`, so `bf_ms` is ground-truth loading/mapping time rather than brute-force search time.
+
+| Label | Parts | Strategy | Append k | Build ms | Candidate ms | Search ms | Recall@12 | Notes |
+|---|---:|---|---:|---:|---:|---:|---:|---|
+| `full10_noopt_append0` | 10 | no optimize, no cross candidates | 0 | 32496.823 | 0.011 | 97.008 | 0.097592 | Disconnected 10-way floor, about one partition's worth of neighbors |
+| `full10_noopt_query_one_append2_canditopk2` | 10 | no optimize, ring query-one | 2 | 53864.023 | 29973.908 | 65.732 | 0.575333 | One target partition per source is not enough, but repairs much of the disconnected floor |
+| `full10_noopt_query_all_append2_canditopk2` | 10 | no optimize, query all other parts | 2 | 145437.853 | 121098.490 | 66.259 | 0.760125 | All-to-all cross candidates help but append2 under-doses multi-way connectivity |
+| `full10_noopt_query_all_append8_canditopk8` | 10 | no optimize, query all other parts | 8 | 207260.762 | 180505.268 | 71.539 | 0.883258 | Higher raw degree improves recall; candidate generation dominates |
+| `full10_noopt_query_all_append16_canditopk16` | 10 | no optimize, query all other parts | 16 | 321798.768 | 290036.318 | 78.367 | 0.914700 | Best full 10-way no-opt row so far, but expensive and searches degree 80 |
+
+Direct optimize over all ten 1M parts ran out of memory during `sort_knn_graph` while trying to allocate another `30.7 GB`. Following up on that with smaller full-subgraph subsets, these rows use brute-force ground truth over only the selected subset. That makes them fair tests of physical merge quality for a smaller fan-in, not directly comparable to the full 10-way ground-truth rows above.
+
+| Label | Parts | Rows | Append k | Build ms | Candidate ms | Search ms | Recall@12 | Notes |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| `sub10m_p2_direct_partition_only` | 2 | 2M | 0 | 6239.668 | 0.012 | 96.619 | 0.484942 | Two disconnected 1M graphs; optimize alone does not invent cross edges |
+| `sub10m_p2_direct_query_all_append2_canditopk2` | 2 | 2M | 2 | 13047.890 | 6645.077 | 62.936 | 0.949942 | Strong repair, but below the earlier 1M 50/50 append2 result |
+| `sub10m_p3_direct_query_all_append2_canditopk2` | 3 | 3M | 2 | 21916.257 | 12794.442 | 63.560 | 0.934550 | Recall drops as fan-in grows; append2 is under-dosed |
+| `sub10m_p3_direct_query_all_append8_canditopk8` | 3 | 3M | 8 | 27466.584 | 17308.827 | 63.144 | 0.951658 | More cross candidates recover quality for 3-way merge |
+| `sub10m_p4_direct_query_all_append8_canditopk8` | 4 | 4M | 8 | 44157.728 | 30624.291 | 63.554 | 0.945133 | Still fits; recall starts trending down |
+| `sub10m_p5_direct_query_all_append8_canditopk8` | 5 | 5M | 8 | 61588.528 | 45877.280 | 63.802 | 0.938825 | Candidate generation dominates build time |
+| `sub10m_p7_direct_query_all_append8_canditopk8` | 7 | 7M | 8 | 111262.136 | 89584.769 | 64.186 | 0.928450 | Large fan-in all-to-all append is expensive and lower quality |
+| `sub10m_p8_direct_query_all_append8_canditopk8` | 8 | 8M | 8 | 142698.867 | 117408.442 | 64.438 | 0.922150 | Largest direct-optimize subset that fit in this run |
+
+A 9-part direct-optimize append8 run OOMed during `sort_knn_graph` while trying to allocate `27.6 GB`; the 10-part partition-only direct-optimize run OOMed on a `30.7 GB` allocation. This makes small-fan-in physical compaction a practical way to evaluate optimize-based methods, but it also argues against a single all-at-once 10-way optimize in this harness.
+
+Multi-way interpretation: the simple append recipe does transfer, but not cleanly. On 10-way random splits, the number of missing cross-partition routes grows with fan-in, and append2 is not enough. Increasing append k helps substantially, but all-to-all candidate generation scales like `parts * (parts - 1)` and becomes the dominant cost. The sister-repo `lowcross_reprune` and balanced-compaction ideas are directly relevant here: rather than querying every row against every other part, we need boundary/interior dosing, tree-style pairwise or small-fan-in compaction, and likely a cheaper cross-candidate routing policy.
+
 ## Findings So Far
 
 - Seeded NN-Descent is not competitive with the current IVF-PQ scratch baseline on this dataset. It can produce high recall (`0.982858`), but the 20-iteration run spends `54.8 s` in NN-Descent alone. One to three iterations actively degrade the strong direct query-append seed graph (`0.863100`, `0.880533`, `0.901983` recall@12), and five iterations is still below scratch even with query-generated candidates (`0.951317`).
 - Query-generated cross-partition appends are doing the useful merge work. Without NN-Descent or optimize, append1 already reaches `0.965483` recall@12, append8 reaches `0.976608`, and append32 reaches `0.983792`. The append32 no-optimize row is the highest recall measured here, but it keeps a degree-96 graph and searches in `84.193 ms`.
-- Direct optimize remains the better balanced path when the output should be a normal degree-64 CAGRA graph. Querying the opposite partition index for every row and appending 2 to 8 candidates produces scratch-comparable or better recall, with merged-index search around `60 ms` versus `91.8 ms` for the scratch IVF-PQ index and `152.5 ms` for query-time split merge.
-- No-optimize is a plausible alternative only if the larger raw degree is acceptable. It saves the sort/optimize work and can improve high-k recall, but search time climbs with append k (`65.0 ms` at k8, `71.3 ms` at k16, `84.2 ms` at k32).
+- Direct optimize remains the better balanced path when the output should be a normal degree-64 CAGRA graph. Querying the opposite partition index for every row and appending 2 to 8 candidates produces scratch-comparable or better recall on 2-way 1M, with merged-index search around `60 ms` versus `91.8 ms` for the scratch IVF-PQ index and `152.5 ms` for query-time split merge. On 10M k-way subsets, direct optimize is feasible up to 8 selected 1M parts in this harness, but recall falls from `0.951658` at 3 parts append8 to `0.922150` at 8 parts append8.
+- No-optimize is a plausible alternative only if the larger raw degree is acceptable. It saves the sort/optimize work and can improve high-k recall, but search time climbs with append k (`65.0 ms` at k8, `71.3 ms` at k16, `84.2 ms` at k32 on 2-way 1M; `78.4 ms` at k16 on full 10-way 10M). Full 10-way no-optimize append16 reaches `0.914700` recall@12, but spends `290 s` in all-to-all candidate generation.
+- Multi-way all-at-once merging is harder than the 2-way case. Query-all append2 reaches only `0.760125` recall@12 on the full 10-way 10M split without optimize, and direct optimize over all 10 parts OOMs in the current harness. Smaller fan-in experiments show that append8 plus optimize is viable and reasonably strong, which points toward tree-style compaction instead of a single 10-way optimize pass.
 - Random global candidates are ineffective for direct optimization and low-iteration NN-Descent on this split. Recall stays near `0.50` direct and `0.74` with five NN-Descent iterations.
 - Sampling rows hurts direct-query append quality. At 75% sampling, append32 nearly matches scratch (`0.974125` vs `0.974558`), but it is still slower than scratch. Lower samples are clearly below scratch recall.
 - Append is better than replacement in the current prototype. Random replacement can reach good recall, but per-row replacement slot selection is slower than append. Farthest/nearest replacement computed on CPU is not viable as implemented.
@@ -145,5 +179,7 @@ No-optimize shows that the cross-query append itself carries most of the quality
 - Avoid deserialization in the timing path by running the merge experiment on live indexes, or subtract `load_graph_ms` consistently when comparing merge API costs.
 - Optimize candidate generation: separate candidate search params, lower `itopk`, larger or direct device batches, and maybe a specialized all-points cross-index search path that avoids per-batch host gathers.
 - Try appending 2 to 4 query candidates plus a cheap graph connectivity post-pass instead of NN-Descent.
+- For multi-way merges, prioritize a tree or tournament compaction schedule with fan-in no larger than 4-8 parts, since direct optimize fits up to 8 1M parts here but OOMs at 9-10 parts.
+- Port the sister-repo low-cross idea into this harness: light cross-search all rows, classify boundary rows by cross/within distance ratio, then run richer cross-search only for boundary rows before optimize.
 - Separate the no-optimize effect from the larger-degree effect by pruning the raw `64 + append_k` graph back to 64 neighbors without full CAGRA optimize, and by comparing optimized output degrees 80 and 96 against the no-optimize k16/k32 rows.
 - If seeded NN-Descent remains in scope, add an early-stop / low-iteration mode designed for already-good seeds; the stock iteration cost is too high here.
