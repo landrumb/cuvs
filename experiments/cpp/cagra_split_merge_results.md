@@ -60,6 +60,27 @@ Selected merge-construction variants:
 | `full_direct_query_replace8_farthest_sample10` | query opposite index, direct optimize | replace | 0.10 | 8 | 64 | 54774.543 | 52586.737 | 60.187 | 0.966167 | CPU distance ranking dominates |
 | `full_direct_query_replace8_nearest_sample10` | query opposite index, direct optimize | replace | 0.10 | 8 | 64 | 55520.264 | 53296.153 | 60.325 | 0.965692 | No quality win; also very expensive |
 
+## One-Point Search Recall
+
+The recall numbers in this log were evaluated with CAGRA's default single-point search initialization: `search_width = 1` and `num_random_samplings = 1`. Candidate-generation searches also used those defaults unless otherwise noted; the `candidate_itopk` sweep only changes `itopk_size`.
+
+Focused promising rows under this caveat:
+
+| Label | Build ms | Build ms excl. load | Search ms | Recall@12 |
+|---|---:|---:|---:|---:|
+| `full_scratch_ivfpq` | 3218.448 | 3218.448 | 91.759 | 0.974558 |
+| `full_direct_query_append2_canditopk2` | 6171.050 | 3936.804 | 60.295 | 0.975108 |
+| `full_direct_query_all_append2_canditopk2` | 6291.284 | 4007.985 | 60.265 | 0.975142 |
+| `full_direct_query_append2_canditopk8` | 6643.911 | 4422.506 | 60.113 | 0.976617 |
+| `full_direct_query_append4_canditopk4` | 6432.502 | 4204.649 | 60.009 | 0.977417 |
+| `full_direct_query_append4_canditopk8` | 6724.300 | 4507.140 | 59.943 | 0.978083 |
+| `full_direct_query_append8_canditopk8` | 7052.322 | 4794.978 | 60.071 | 0.980325 |
+| `full_direct_query_append8_canditopk16` | 7775.009 | 5515.512 | 59.911 | 0.980533 |
+| `full_direct_query_append32` | 13076.654 | 10840.823 | 60.279 | 0.981642 |
+| `full_direct_query_replace8_random` | 14478.177 | 12322.101 | 59.883 | 0.979292 |
+| `full_seed_partition_only` | 57966.563 | 55826.697 | 94.010 | 0.982858 |
+
+
 ## Candidate Beam Sweep
 
 These runs use direct optimize (`--skip-nnd`) with query candidates and full-row append. `Candidate itopk` is the CAGRA search beam used while querying the other partition index to generate candidates.
