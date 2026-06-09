@@ -49,6 +49,7 @@ enum class scratch_algo { nn_descent, ivf_pq, auto_select };
 
 struct options {
   std::string split_dir = "/raid/blandrum/split-wiki";
+  std::string groundtruth_path;
   std::string output_csv;
   std::string label = "run";
   int64_t topk = 12;
@@ -64,6 +65,8 @@ struct options {
   size_t query_batch_size = 10000;
   size_t rows_per_part = 0;
   size_t query_count = 0;
+  size_t part_start = 0;
+  size_t part_count_limit = 0;
   bool skip_scratch = false;
   bool skip_variant = false;
   bool skip_nnd = false;
@@ -80,10 +83,17 @@ struct fbin_matrix {
   std::vector<float> data;
 };
 
+struct ibin_matrix {
+  uint32_t rows = 0;
+  uint32_t dim  = 0;
+  std::vector<int32_t> data;
+};
+
 struct split_part {
   std::string name;
   std::filesystem::path dir;
   fbin_matrix data;
+  std::vector<uint32_t> original_ids;
   size_t global_offset = 0;
 };
 
@@ -140,6 +150,7 @@ std::string usage()
 
 Options:
   --split-dir <dir>              Split artifacts dir (default /raid/blandrum/split-wiki)
+  --groundtruth <neighbors.ibin> Use precomputed source-ID ground truth instead of brute force
   --output-csv <file>            Append one CSV row with metrics
   --label <name>                 Run label
   --topk <int>                   Recall/search k (default 12)
@@ -159,6 +170,8 @@ Options:
   --query-batch-size <int>       Candidate-generation query batch size (default 10000)
   --rows-per-part <int>          Use first N rows from each part for quick sanity runs
   --query-count <int>            Use first N queries for quick sanity runs
+  --part-start <int>             First sorted part_* directory to load (default 0)
+  --part-count <int>             Number of sorted part_* directories to load (default all)
   --scratch-algo <nn-descent|ivf-pq|auto>
   --skip-scratch                 Do not build/search from-scratch CAGRA baseline
   --skip-variant                 Only run brute force and optional scratch baseline
@@ -263,6 +276,8 @@ options parse_args(int argc, char** argv)
 
     if (arg == "--split-dir") {
       opts.split_dir = need_value(arg);
+    } else if (arg == "--groundtruth") {
+      opts.groundtruth_path = need_value(arg);
     } else if (arg == "--output-csv") {
       opts.output_csv = need_value(arg);
     } else if (arg == "--label") {
@@ -299,6 +314,10 @@ options parse_args(int argc, char** argv)
       opts.rows_per_part = static_cast<size_t>(parse_u64(need_value(arg), arg));
     } else if (arg == "--query-count") {
       opts.query_count = static_cast<size_t>(parse_u64(need_value(arg), arg));
+    } else if (arg == "--part-start") {
+      opts.part_start = static_cast<size_t>(parse_u64(need_value(arg), arg));
+    } else if (arg == "--part-count") {
+      opts.part_count_limit = static_cast<size_t>(parse_u64(need_value(arg), arg));
     } else if (arg == "--scratch-algo") {
       opts.scratch = parse_scratch_algo(need_value(arg));
     } else if (arg == "--skip-scratch") {
@@ -376,6 +395,40 @@ fbin_matrix read_fbin(const std::filesystem::path& path,
   return matrix;
 }
 
+ibin_matrix read_ibin(const std::filesystem::path& path,
+                      std::optional<size_t> row_limit = std::nullopt)
+{
+  std::ifstream in(path, std::ios::binary);
+  if (!in) { throw std::runtime_error("Could not open " + path.string()); }
+
+  ibin_matrix matrix;
+  read_exact(in, reinterpret_cast<char*>(&matrix.rows), sizeof(uint32_t), path.string());
+  read_exact(in, reinterpret_cast<char*>(&matrix.dim), sizeof(uint32_t), path.string());
+
+  uint32_t rows_to_read = matrix.rows;
+  if (row_limit.has_value()) {
+    rows_to_read = std::min<uint32_t>(rows_to_read, static_cast<uint32_t>(*row_limit));
+  }
+  const size_t count = static_cast<size_t>(rows_to_read) * matrix.dim;
+  matrix.data.resize(count);
+  read_large(in, reinterpret_cast<char*>(matrix.data.data()), count * sizeof(int32_t), path.string());
+  matrix.rows = rows_to_read;
+  return matrix;
+}
+
+std::vector<uint32_t> read_original_ids(const std::filesystem::path& path,
+                                        std::optional<size_t> row_limit = std::nullopt)
+{
+  auto matrix = read_ibin(path, row_limit);
+  if (matrix.dim != 1) { throw std::runtime_error("original_ids.ibin must have dim=1"); }
+  std::vector<uint32_t> ids(matrix.rows);
+  for (size_t i = 0; i < ids.size(); ++i) {
+    if (matrix.data[i] < 0) { throw std::runtime_error("original_ids.ibin contains negative IDs"); }
+    ids[i] = static_cast<uint32_t>(matrix.data[i]);
+  }
+  return ids;
+}
+
 bool is_partition_dir(const std::filesystem::directory_entry& entry)
 {
   if (!entry.is_directory()) return false;
@@ -407,14 +460,27 @@ loaded_split load_split(const options& opts)
   split.queries = read_fbin(root / "queries.fbin", query_limit);
   split.dim     = split.queries.dim;
 
+  auto dirs = partition_dirs(root);
+  if (opts.part_start >= dirs.size()) { throw std::runtime_error("--part-start is out of range"); }
+  size_t end_part = dirs.size();
+  if (opts.part_count_limit > 0) {
+    end_part = std::min(end_part, opts.part_start + opts.part_count_limit);
+  }
+  if (end_part - opts.part_start < 2) { throw std::runtime_error("Need at least two selected parts"); }
+
   size_t offset = 0;
-  for (const auto& dir : partition_dirs(root)) {
+  for (size_t part_id = opts.part_start; part_id < end_part; ++part_id) {
+    const auto& dir = dirs[part_id];
     split_part part;
     part.name          = dir.filename().string();
     part.dir           = dir;
     part.global_offset = offset;
     part.data          = read_fbin(dir / "dataset.fbin", rows_limit);
+    part.original_ids  = read_original_ids(dir / "original_ids.ibin", rows_limit);
     if (part.data.dim != split.dim) { throw std::runtime_error("Dataset/query dimensions do not match"); }
+    if (part.original_ids.size() != part.data.rows) {
+      throw std::runtime_error("original_ids.ibin row count does not match dataset.fbin");
+    }
     offset += part.data.rows;
     split.parts.push_back(std::move(part));
   }
@@ -981,6 +1047,53 @@ double recall_at_k(const std::vector<int64_t>& expected,
   return static_cast<double>(matches) / static_cast<double>(rows * k);
 }
 
+std::vector<int64_t> groundtruth_neighbors(const options& opts,
+                                           const loaded_split& split,
+                                           double& load_map_ms,
+                                           size_t& missing_expected)
+{
+  auto start = clock_type::now();
+  std::optional<size_t> query_limit;
+  if (opts.query_count > 0) { query_limit = opts.query_count; }
+  auto gt = read_ibin(opts.groundtruth_path, query_limit);
+  if (gt.rows != split.queries.rows) {
+    throw std::runtime_error("Ground truth row count does not match query count");
+  }
+  if (gt.dim < static_cast<uint32_t>(opts.topk)) {
+    throw std::runtime_error("Ground truth dim must be >= topk");
+  }
+
+  uint32_t max_original_id = 0;
+  for (const auto& part : split.parts) {
+    for (uint32_t id : part.original_ids) {
+      max_original_id = std::max(max_original_id, id);
+    }
+  }
+  std::vector<int64_t> original_to_global(static_cast<size_t>(max_original_id) + 1, -1);
+  for (const auto& part : split.parts) {
+    for (size_t local = 0; local < part.original_ids.size(); ++local) {
+      uint32_t original = part.original_ids[local];
+      original_to_global[original] = static_cast<int64_t>(part.global_offset + local);
+    }
+  }
+
+  std::vector<int64_t> expected(static_cast<size_t>(gt.rows) * static_cast<size_t>(opts.topk), -1);
+  missing_expected = 0;
+  for (size_t row = 0; row < gt.rows; ++row) {
+    for (int64_t col = 0; col < opts.topk; ++col) {
+      int32_t original = gt.data[row * gt.dim + static_cast<size_t>(col)];
+      int64_t mapped = -1;
+      if (original >= 0 && static_cast<size_t>(original) < original_to_global.size()) {
+        mapped = original_to_global[static_cast<size_t>(original)];
+      }
+      if (mapped < 0) { ++missing_expected; }
+      expected[row * static_cast<size_t>(opts.topk) + static_cast<size_t>(col)] = mapped;
+    }
+  }
+  load_map_ms = elapsed_ms(start, clock_type::now());
+  return expected;
+}
+
 std::vector<int64_t> brute_force_neighbors(raft::device_resources const& res,
                                            raft::device_matrix<float, int64_t>& dataset,
                                            raft::device_matrix<float, int64_t>& queries,
@@ -1129,8 +1242,18 @@ int main(int argc, char** argv)
     auto queries_dev = copy_to_device(res, split.queries);
 
     run_metrics metrics;
-    std::cout << "Building brute-force ground truth\n";
-    auto bf = brute_force_neighbors(res, combined_dev, queries_dev, opts.topk, metrics.bf_ms);
+    std::vector<int64_t> expected_neighbors;
+    if (!opts.groundtruth_path.empty()) {
+      size_t missing_expected = 0;
+      std::cout << "Loading precomputed ground truth from " << opts.groundtruth_path << "\n";
+      expected_neighbors = groundtruth_neighbors(opts, split, metrics.bf_ms, missing_expected);
+      if (missing_expected > 0) {
+        std::cout << "groundtruth_missing_expected=" << missing_expected << "\n";
+      }
+    } else {
+      std::cout << "Building brute-force ground truth\n";
+      expected_neighbors = brute_force_neighbors(res, combined_dev, queries_dev, opts.topk, metrics.bf_ms);
+    }
 
     if (!opts.skip_scratch) {
       std::cout << "Building from-scratch CAGRA baseline (" << to_string(opts.scratch) << ")\n";
@@ -1142,7 +1265,7 @@ int main(int argc, char** argv)
           res, params, raft::make_const_mdspan(combined_dev.view()));
       });
       auto scratch_neighbors = search_index(res, opts, scratch_index, queries_dev, metrics.scratch_search_ms);
-      metrics.scratch_recall = recall_at_k(bf, scratch_neighbors, split.queries.rows, opts.topk);
+      metrics.scratch_recall = recall_at_k(expected_neighbors, scratch_neighbors, split.queries.rows, opts.topk);
     }
 
     size_t seed_degree = 0;
@@ -1226,7 +1349,7 @@ int main(int argc, char** argv)
         });
       }
       auto merged_neighbors = search_index(res, opts, *merged_index, queries_dev, metrics.variant.search_ms);
-      metrics.variant_recall = recall_at_k(bf, merged_neighbors, split.queries.rows, opts.topk);
+      metrics.variant_recall = recall_at_k(expected_neighbors, merged_neighbors, split.queries.rows, opts.topk);
     }
 
     append_csv(opts, split, n_selected, seed_degree, metrics);
