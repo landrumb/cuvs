@@ -67,6 +67,7 @@ struct options {
   bool skip_scratch = false;
   bool skip_variant = false;
   bool skip_nnd = false;
+  bool skip_optimize = false;
   candidate_strategy candidates = candidate_strategy::random_global;
   insert_mode insertion = insert_mode::append;
   replace_policy replacement = replace_policy::random;
@@ -141,6 +142,7 @@ Options:
   --skip-scratch                 Do not build/search from-scratch CAGRA baseline
   --skip-variant                 Only run brute force and optional scratch baseline
   --skip-nnd                     Sort/optimize the mixed seed graph directly
+  --skip-optimize                Search the mixed graph without CAGRA optimize
 )";
 }
 
@@ -284,6 +286,8 @@ options parse_args(int argc, char** argv)
       opts.skip_variant = true;
     } else if (arg == "--skip-nnd") {
       opts.skip_nnd = true;
+    } else if (arg == "--skip-optimize") {
+      opts.skip_optimize = true;
     } else if (arg == "--help" || arg == "-h") {
       std::cout << usage();
       std::exit(0);
@@ -1035,15 +1039,19 @@ int main(int argc, char** argv)
 
       auto knn_graph = raft::make_host_matrix<uint32_t, int64_t, raft::row_major>(0, 0);
       if (opts.skip_nnd) {
-        std::cout << "Skipping NN-Descent; sorting mixed seed graph directly\n";
         knn_graph = seed_to_host_graph(seed_graph, total_rows, seed_degree, opts.seed);
-        metrics.variant.sort_ms = time_cuda(res, [&] {
-          cuvs::neighbors::cagra::detail::graph::sort_knn_graph(
-            res,
-            cuvs::distance::DistanceType::L2Expanded,
-            raft::make_const_mdspan(combined_dev.view()),
-            knn_graph.view());
-        });
+        if (opts.skip_optimize) {
+          std::cout << "Skipping NN-Descent and CAGRA optimize; searching mixed seed graph directly\n";
+        } else {
+          std::cout << "Skipping NN-Descent; sorting mixed seed graph directly\n";
+          metrics.variant.sort_ms = time_cuda(res, [&] {
+            cuvs::neighbors::cagra::detail::graph::sort_knn_graph(
+              res,
+              cuvs::distance::DistanceType::L2Expanded,
+              raft::make_const_mdspan(combined_dev.view()),
+              knn_graph.view());
+          });
+        }
       } else {
         std::cout << "Running seeded NN-Descent\n";
         knn_graph = build_seeded_nnd_graph(res,
@@ -1055,21 +1063,29 @@ int main(int argc, char** argv)
                                            metrics.variant.sort_ms);
       }
 
-      std::cout << "Optimizing CAGRA graph\n";
-      auto optimized_graph = raft::make_host_matrix<uint32_t, int64_t, raft::row_major>(
-        static_cast<int64_t>(total_rows), static_cast<int64_t>(opts.graph_degree));
-      metrics.variant.optimize_ms = time_cuda(res, [&] {
-        cuvs::neighbors::cagra::helpers::optimize(res, knn_graph.view(), optimized_graph.view());
-      });
-
       std::cout << "Constructing searchable merged index\n";
       std::optional<cuvs::neighbors::cagra::index<float, uint32_t>> merged_index;
-      metrics.variant.index_ms = time_cuda(res, [&] {
-        merged_index.emplace(res,
-                             cuvs::distance::DistanceType::L2Expanded,
-                             raft::make_const_mdspan(combined_dev.view()),
-                             raft::make_const_mdspan(optimized_graph.view()));
-      });
+      if (opts.skip_optimize) {
+        metrics.variant.index_ms = time_cuda(res, [&] {
+          merged_index.emplace(res,
+                               cuvs::distance::DistanceType::L2Expanded,
+                               raft::make_const_mdspan(combined_dev.view()),
+                               raft::make_const_mdspan(knn_graph.view()));
+        });
+      } else {
+        std::cout << "Optimizing CAGRA graph\n";
+        auto optimized_graph = raft::make_host_matrix<uint32_t, int64_t, raft::row_major>(
+          static_cast<int64_t>(total_rows), static_cast<int64_t>(opts.graph_degree));
+        metrics.variant.optimize_ms = time_cuda(res, [&] {
+          cuvs::neighbors::cagra::helpers::optimize(res, knn_graph.view(), optimized_graph.view());
+        });
+        metrics.variant.index_ms = time_cuda(res, [&] {
+          merged_index.emplace(res,
+                               cuvs::distance::DistanceType::L2Expanded,
+                               raft::make_const_mdspan(combined_dev.view()),
+                               raft::make_const_mdspan(optimized_graph.view()));
+        });
+      }
       auto merged_neighbors = search_index(res, opts, *merged_index, queries_dev, metrics.variant.search_ms);
       metrics.variant_recall = recall_at_k(bf, merged_neighbors, split.queries.rows, opts.topk);
     }
