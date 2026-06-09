@@ -1236,6 +1236,40 @@ void GnndGraph<Index_t>::init_random_graph()
 }
 
 template <typename Index_t>
+void GnndGraph<Index_t>::init_seeded_graph(const Index_t* initial_graph,
+                                           size_t initial_graph_degree)
+{
+  init_random_graph();
+  if (initial_graph == nullptr || initial_graph_degree == 0) { return; }
+
+#pragma omp parallel for
+  for (size_t i = 0; i < nrow; i++) {
+    for (size_t j = 0; j < initial_graph_degree; j++) {
+      Index_t id = initial_graph[i * initial_graph_degree + j];
+      if (id < 0 || static_cast<size_t>(id) >= nrow || static_cast<size_t>(id) == i) { continue; }
+
+      int seg_idx       = id % num_segments;
+      auto list         = h_graph + i * node_degree + seg_idx * segment_size;
+      auto dist_list    = h_dists.data_handle() + i * node_degree + seg_idx * segment_size;
+      bool already_seen = false;
+      for (int slot = 0; slot < segment_size; slot++) {
+        if (list[slot].id() == id) {
+          list[slot].id_with_flag() = id;
+          dist_list[slot]           = 0.0f;
+          already_seen              = true;
+          break;
+        }
+      }
+      if (!already_seen) {
+        InternalID_t<Index_t> seeded_id;
+        seeded_id.id_with_flag() = id;
+        insert_to_ordered_list(list, dist_list, segment_size, seeded_id, 0.0f);
+      }
+    }
+  }
+}
+
+template <typename Index_t>
 void GnndGraph<Index_t>::sample_graph(bool sample_new)
 {
   std::fill_n(h_graph_old.data_handle(), nrow * num_samples, std::numeric_limits<Index_t>::max());
@@ -1488,6 +1522,8 @@ void GNND<Data_t, Index_t>::build(Data_t* data,
                                   Index_t* output_graph,
                                   bool return_distances,
                                   DistData_t* output_distances,
+                                  const Index_t* initial_graph,
+                                  size_t initial_graph_degree,
                                   DistEpilogue_t dist_epilogue)
 {
   using input_t = typename std::remove_const<Data_t>::type;
@@ -1596,7 +1632,11 @@ void GNND<Data_t, Index_t>::build(Data_t* data,
   }
 
   graph_.clear();
-  graph_.init_random_graph();
+  if (initial_graph != nullptr && initial_graph_degree > 0) {
+    graph_.init_seeded_graph(initial_graph, initial_graph_degree);
+  } else {
+    graph_.init_random_graph();
+  }
   graph_.sample_graph(true);
 
   auto update_and_sample = [&](bool update_graph) {
@@ -1773,11 +1813,11 @@ void build(raft::resources const& res,
                  "distance view to be allocated.");
   }
 
+  auto graph = idx.graph();
 #pragma omp parallel for
   for (size_t i = 0; i < static_cast<size_t>(dataset.extent(0)); i++) {
     for (size_t j = 0; j < graph_degree; j++) {
-      auto graph                  = idx.graph().data_handle();
-      graph[i * graph_degree + j] = int_graph.data_handle()[i * extended_graph_degree + j];
+      graph(i, j) = int_graph.data_handle()[i * extended_graph_degree + j];
     }
   }
 }
