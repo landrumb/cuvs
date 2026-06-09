@@ -34,6 +34,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -42,7 +43,7 @@ namespace {
 using clock_type = std::chrono::steady_clock;
 constexpr uint32_t invalid_id = std::numeric_limits<uint32_t>::max();
 
-enum class candidate_strategy { none, random_global, query_one, query_window, query_all };
+enum class candidate_strategy { none, random_global, query_one, query_window, query_sampled, query_all };
 enum class insert_mode { replace, append };
 enum class replace_policy { random, farthest, nearest };
 enum class scratch_algo { nn_descent, ivf_pq, auto_select };
@@ -64,6 +65,7 @@ struct options {
   size_t candidate_itopk_size = 0;
   size_t query_batch_size = 10000;
   size_t query_window_size = 2;
+  size_t target_sample_rows = 1024;
   size_t rows_per_part = 0;
   size_t query_count = 0;
   size_t part_start = 0;
@@ -159,7 +161,7 @@ Options:
   --intermediate-graph-degree <int>
                                  NND/CAGRA input graph degree (default 128)
   --candidate-count <int>        Candidates generated per modified row (default 32)
-  --candidate-strategy <none|random-global|query-one|query-window|query-all>
+  --candidate-strategy <none|random-global|query-one|query-window|query-sampled|query-all>
   --insert-mode <replace|append>
   --replace-policy <random|farthest|nearest>
   --replace-fraction <float>     Fraction of base neighbors to replace (default 0.25)
@@ -169,7 +171,8 @@ Options:
   --itopk-size <int>             Final CAGRA search itopk_size (default 64)
   --candidate-itopk-size <int>   Candidate-generation CAGRA search itopk_size
   --query-batch-size <int>       Candidate-generation query batch size (default 10000)
-  --query-window-size <int>      Number of next partitions queried by query-window (default 2)
+  --query-window-size <int>      Number of target partitions for query-window/query-sampled (default 2)
+  --target-sample-rows <int>      Rows per source part for query-sampled routing (default 1024)
   --rows-per-part <int>          Use first N rows from each part for quick sanity runs
   --query-count <int>            Use first N queries for quick sanity runs
   --part-start <int>             First sorted part_* directory to load (default 0)
@@ -204,6 +207,7 @@ candidate_strategy parse_candidate_strategy(const std::string& value)
   if (value == "random-global" || value == "random") return candidate_strategy::random_global;
   if (value == "query-one" || value == "one-index") return candidate_strategy::query_one;
   if (value == "query-window" || value == "window") return candidate_strategy::query_window;
+  if (value == "query-sampled" || value == "sampled-targets") return candidate_strategy::query_sampled;
   if (value == "query-all" || value == "all-indices") return candidate_strategy::query_all;
   throw std::runtime_error("Invalid --candidate-strategy");
 }
@@ -238,6 +242,7 @@ std::string to_string(candidate_strategy value)
     case candidate_strategy::random_global: return "random-global";
     case candidate_strategy::query_one: return "query-one";
     case candidate_strategy::query_window: return "query-window";
+    case candidate_strategy::query_sampled: return "query-sampled";
     case candidate_strategy::query_all: return "query-all";
   }
   return "unknown";
@@ -316,6 +321,8 @@ options parse_args(int argc, char** argv)
       opts.query_batch_size = static_cast<size_t>(parse_u64(need_value(arg), arg));
     } else if (arg == "--query-window-size") {
       opts.query_window_size = static_cast<size_t>(parse_u64(need_value(arg), arg));
+    } else if (arg == "--target-sample-rows") {
+      opts.target_sample_rows = static_cast<size_t>(parse_u64(need_value(arg), arg));
     } else if (arg == "--rows-per-part") {
       opts.rows_per_part = static_cast<size_t>(parse_u64(need_value(arg), arg));
     } else if (arg == "--query-count") {
@@ -357,6 +364,7 @@ options parse_args(int argc, char** argv)
   }
   if (opts.query_batch_size == 0) { throw std::runtime_error("--query-batch-size must be > 0"); }
   if (opts.query_window_size == 0) { throw std::runtime_error("--query-window-size must be > 0"); }
+  if (opts.target_sample_rows == 0) { throw std::runtime_error("--target-sample-rows must be > 0"); }
   if (opts.output_csv.empty()) {
     opts.output_csv = (std::filesystem::path(opts.split_dir) / "merge_construction_results.csv").string();
   }
@@ -686,6 +694,58 @@ void insert_candidate(std::vector<uint32_t>& candidates,
   }
 }
 
+std::vector<size_t> evenly_sampled_rows(size_t rows, size_t sample_count)
+{
+  std::vector<size_t> sampled;
+  if (rows == 0 || sample_count == 0) return sampled;
+  size_t actual = std::min(rows, sample_count);
+  sampled.reserve(actual);
+  for (size_t i = 0; i < actual; ++i) {
+    sampled.push_back((i * rows) / actual);
+  }
+  return sampled;
+}
+
+double sampled_target_distance(
+  raft::device_resources const& res,
+  const options& opts,
+  const cuvs::neighbors::cagra::index<float, uint32_t>& target_index,
+  const fbin_matrix& query_part,
+  const std::vector<size_t>& sampled_rows)
+{
+  if (sampled_rows.empty()) return std::numeric_limits<double>::infinity();
+
+  cuvs::neighbors::cagra::search_params search_params;
+  size_t candidate_itopk = opts.candidate_itopk_size == 0 ? opts.itopk_size : opts.candidate_itopk_size;
+  search_params.itopk_size = std::max<size_t>(candidate_itopk, 1);
+
+  double total = 0.0;
+  size_t count = 0;
+  std::vector<float> batch_host;
+  for (size_t begin = 0; begin < sampled_rows.size(); begin += opts.query_batch_size) {
+    size_t rows = std::min(opts.query_batch_size, sampled_rows.size() - begin);
+    fill_query_batch(query_part, sampled_rows, begin, rows, batch_host);
+    auto batch_dev = copy_to_device(res, batch_host, static_cast<uint32_t>(rows), query_part.dim);
+    auto neigh     = raft::make_device_matrix<uint32_t, int64_t>(res, rows, 1);
+    auto dist      = raft::make_device_matrix<float, int64_t>(res, rows, 1);
+
+    cuvs::neighbors::cagra::search(res,
+                                   search_params,
+                                   target_index,
+                                   raft::make_const_mdspan(batch_dev.view()),
+                                   neigh.view(),
+                                   dist.view());
+    auto dist_host = copy_device_view_to_host<float>(res, dist.view());
+    for (float value : dist_host) {
+      if (std::isfinite(value)) {
+        total += static_cast<double>(value);
+        ++count;
+      }
+    }
+  }
+  return count == 0 ? std::numeric_limits<double>::infinity() : total / static_cast<double>(count);
+}
+
 void query_partition_with_index(
   raft::device_resources const& res,
   const options& opts,
@@ -756,6 +816,43 @@ void generate_query_candidates(raft::device_resources const& res,
   std::vector<float> candidate_dists(candidates.size(), std::numeric_limits<float>::infinity());
   const size_t n_parts = split.parts.size();
   const size_t window_size = std::min(opts.query_window_size, n_parts - 1);
+
+  std::vector<std::vector<uint8_t>> sampled_targets;
+  if (opts.candidates == candidate_strategy::query_sampled) {
+    sampled_targets.assign(n_parts, std::vector<uint8_t>(n_parts, 0));
+    std::vector<std::vector<size_t>> route_samples;
+    route_samples.reserve(n_parts);
+    for (const auto& part : split.parts) {
+      route_samples.push_back(evenly_sampled_rows(part.data.rows, opts.target_sample_rows));
+    }
+
+    std::vector<std::vector<double>> mean_dist(
+      n_parts, std::vector<double>(n_parts, std::numeric_limits<double>::infinity()));
+    for (size_t target_id = 0; target_id < n_parts; ++target_id) {
+      const auto& target = split.parts[target_id];
+      cuvs::neighbors::cagra::index<float, uint32_t> target_index(res);
+      cuvs::neighbors::cagra::deserialize(res, (target.dir / "index.cag").string(), &target_index);
+      for (size_t source_id = 0; source_id < n_parts; ++source_id) {
+        if (source_id == target_id) continue;
+        mean_dist[source_id][target_id] = sampled_target_distance(
+          res, opts, target_index, split.parts[source_id].data, route_samples[source_id]);
+      }
+    }
+
+    for (size_t source_id = 0; source_id < n_parts; ++source_id) {
+      std::vector<std::pair<double, size_t>> ranked;
+      ranked.reserve(n_parts - 1);
+      for (size_t target_id = 0; target_id < n_parts; ++target_id) {
+        if (source_id == target_id) continue;
+        ranked.emplace_back(mean_dist[source_id][target_id], target_id);
+      }
+      std::sort(ranked.begin(), ranked.end());
+      for (size_t i = 0; i < std::min(window_size, ranked.size()); ++i) {
+        sampled_targets[source_id][ranked[i].second] = 1;
+      }
+    }
+  }
+
   auto should_query = [&](size_t source_id, size_t target_id) {
     if (source_id == target_id) return false;
     switch (opts.candidates) {
@@ -765,6 +862,7 @@ void generate_query_candidates(raft::device_resources const& res,
         size_t ring_delta = (target_id + n_parts - source_id) % n_parts;
         return ring_delta >= 1 && ring_delta <= window_size;
       }
+      case candidate_strategy::query_sampled: return sampled_targets[source_id][target_id] != 0;
       default: return false;
     }
   };
@@ -1288,6 +1386,7 @@ int main(int argc, char** argv)
         generate_random_candidates(opts, rows_total, candidates, selected);
       } else if (opts.candidates == candidate_strategy::query_one ||
                  opts.candidates == candidate_strategy::query_window ||
+                 opts.candidates == candidate_strategy::query_sampled ||
                  opts.candidates == candidate_strategy::query_all) {
         std::cout << "Generating query candidates across partition indexes\n";
         generate_query_candidates(res, opts, split, selected, candidates);
