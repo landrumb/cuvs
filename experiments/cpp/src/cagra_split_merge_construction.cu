@@ -80,11 +80,32 @@ struct fbin_matrix {
   std::vector<float> data;
 };
 
-struct loaded_split {
-  fbin_matrix part0;
-  fbin_matrix part1;
-  fbin_matrix queries;
+struct split_part {
+  std::string name;
+  std::filesystem::path dir;
+  fbin_matrix data;
+  size_t global_offset = 0;
 };
+
+struct loaded_split {
+  std::vector<split_part> parts;
+  fbin_matrix queries;
+  uint32_t dim = 0;
+};
+
+size_t part_count(const loaded_split& split)
+{
+  return split.parts.size();
+}
+
+size_t total_rows(const loaded_split& split)
+{
+  size_t total = 0;
+  for (const auto& part : split.parts) {
+    total += part.data.rows;
+  }
+  return total;
+}
 
 struct graph_copy {
   std::vector<uint32_t> graph;
@@ -322,6 +343,18 @@ void read_exact(std::istream& in, char* dst, std::streamsize bytes, const std::s
   if (in.gcount() != bytes) { throw std::runtime_error("Unexpected EOF while reading " + path); }
 }
 
+void read_large(std::istream& in, char* dst, size_t bytes, const std::string& path)
+{
+  constexpr size_t chunk_bytes = 1ull << 30;
+  size_t done = 0;
+  while (done < bytes) {
+    auto chunk = static_cast<std::streamsize>(std::min(chunk_bytes, bytes - done));
+    in.read(dst + done, chunk);
+    if (in.gcount() != chunk) { throw std::runtime_error("Unexpected EOF while reading " + path); }
+    done += static_cast<size_t>(chunk);
+  }
+}
+
 fbin_matrix read_fbin(const std::filesystem::path& path,
                       std::optional<size_t> row_limit = std::nullopt)
 {
@@ -338,9 +371,28 @@ fbin_matrix read_fbin(const std::filesystem::path& path,
   }
   const size_t count = static_cast<size_t>(rows_to_read) * matrix.dim;
   matrix.data.resize(count);
-  read_exact(in, reinterpret_cast<char*>(matrix.data.data()), count * sizeof(float), path.string());
+  read_large(in, reinterpret_cast<char*>(matrix.data.data()), count * sizeof(float), path.string());
   matrix.rows = rows_to_read;
   return matrix;
+}
+
+bool is_partition_dir(const std::filesystem::directory_entry& entry)
+{
+  if (!entry.is_directory()) return false;
+  auto name = entry.path().filename().string();
+  if (name.rfind("part_", 0) != 0 || name.size() <= 5) return false;
+  return std::all_of(name.begin() + 5, name.end(), [](char c) { return c >= '0' && c <= '9'; });
+}
+
+std::vector<std::filesystem::path> partition_dirs(const std::filesystem::path& root)
+{
+  std::vector<std::filesystem::path> dirs;
+  for (const auto& entry : std::filesystem::directory_iterator(root)) {
+    if (is_partition_dir(entry)) { dirs.push_back(entry.path()); }
+  }
+  std::sort(dirs.begin(), dirs.end());
+  if (dirs.size() < 2) { throw std::runtime_error("Need at least two part_* directories"); }
+  return dirs;
 }
 
 loaded_split load_split(const options& opts)
@@ -352,21 +404,34 @@ loaded_split load_split(const options& opts)
   if (opts.query_count > 0) { query_limit = opts.query_count; }
 
   loaded_split split;
-  split.part0  = read_fbin(root / "part_000" / "dataset.fbin", rows_limit);
-  split.part1  = read_fbin(root / "part_001" / "dataset.fbin", rows_limit);
   split.queries = read_fbin(root / "queries.fbin", query_limit);
-  if (split.part0.dim != split.part1.dim || split.part0.dim != split.queries.dim) {
-    throw std::runtime_error("Dataset/query dimensions do not match");
+  split.dim     = split.queries.dim;
+
+  size_t offset = 0;
+  for (const auto& dir : partition_dirs(root)) {
+    split_part part;
+    part.name          = dir.filename().string();
+    part.dir           = dir;
+    part.global_offset = offset;
+    part.data          = read_fbin(dir / "dataset.fbin", rows_limit);
+    if (part.data.dim != split.dim) { throw std::runtime_error("Dataset/query dimensions do not match"); }
+    offset += part.data.rows;
+    split.parts.push_back(std::move(part));
   }
   return split;
 }
 
-std::vector<float> concatenate(const fbin_matrix& lhs, const fbin_matrix& rhs)
+std::vector<float> concatenate(const loaded_split& split)
 {
   std::vector<float> out;
-  out.reserve(lhs.data.size() + rhs.data.size());
-  out.insert(out.end(), lhs.data.begin(), lhs.data.end());
-  out.insert(out.end(), rhs.data.begin(), rhs.data.end());
+  size_t values = 0;
+  for (const auto& part : split.parts) {
+    values += part.data.data.size();
+  }
+  out.reserve(values);
+  for (const auto& part : split.parts) {
+    out.insert(out.end(), part.data.data.begin(), part.data.data.end());
+  }
   return out;
 }
 
@@ -512,20 +577,55 @@ void fill_query_batch(const fbin_matrix& source,
   }
 }
 
-void query_other_partition(raft::device_resources const& res,
-                           const options& opts,
-                           const std::filesystem::path& target_index_path,
-                           const fbin_matrix& query_part,
-                           size_t query_global_offset,
-                           size_t target_global_offset,
-                           size_t target_rows_limit,
-                           const std::vector<size_t>& selected_rows,
-                           std::vector<uint32_t>& candidates)
+void insert_candidate(std::vector<uint32_t>& candidates,
+                      std::vector<float>& candidate_dists,
+                      size_t candidate_count,
+                      size_t row,
+                      uint32_t candidate,
+                      float dist)
+{
+  if (candidate_count == 0 || candidate == invalid_id) return;
+  auto base = row * candidate_count;
+  for (size_t c = 0; c < candidate_count; ++c) {
+    if (candidates[base + c] == candidate) {
+      if (dist < candidate_dists[base + c]) { candidate_dists[base + c] = dist; }
+      return;
+    }
+  }
+
+  size_t slot = 0;
+  bool found_empty = false;
+  float worst_dist = -std::numeric_limits<float>::infinity();
+  for (size_t c = 0; c < candidate_count; ++c) {
+    if (candidates[base + c] == invalid_id) {
+      slot = c;
+      found_empty = true;
+      break;
+    }
+    if (candidate_dists[base + c] > worst_dist) {
+      worst_dist = candidate_dists[base + c];
+      slot = c;
+    }
+  }
+  if (found_empty || dist < worst_dist) {
+    candidates[base + slot] = candidate;
+    candidate_dists[base + slot] = dist;
+  }
+}
+
+void query_partition_with_index(
+  raft::device_resources const& res,
+  const options& opts,
+  const cuvs::neighbors::cagra::index<float, uint32_t>& target_index,
+  const fbin_matrix& query_part,
+  size_t query_global_offset,
+  size_t target_global_offset,
+  size_t target_rows_limit,
+  const std::vector<size_t>& selected_rows,
+  std::vector<uint32_t>& candidates,
+  std::vector<float>& candidate_dists)
 {
   if (selected_rows.empty() || opts.candidate_count == 0) return;
-
-  cuvs::neighbors::cagra::index<float, uint32_t> target_index(res);
-  cuvs::neighbors::cagra::deserialize(res, target_index_path.string(), &target_index);
 
   cuvs::neighbors::cagra::search_params search_params;
   size_t candidate_itopk = opts.candidate_itopk_size == 0 ? opts.itopk_size : opts.candidate_itopk_size;
@@ -546,14 +646,20 @@ void query_other_partition(raft::device_resources const& res,
                                    neigh.view(),
                                    dist.view());
     auto neigh_host = copy_device_view_to_host<uint32_t>(res, neigh.view());
+    auto dist_host  = copy_device_view_to_host<float>(res, dist.view());
     for (size_t out_row = 0; out_row < rows; ++out_row) {
       size_t local_row  = selected_rows[begin + out_row];
       size_t global_row = query_global_offset + local_row;
       for (size_t c = 0; c < opts.candidate_count; ++c) {
         uint32_t local_candidate = neigh_host[out_row * opts.candidate_count + c];
         if (local_candidate < target_rows_limit) {
-          candidates[global_row * opts.candidate_count + c] =
-            static_cast<uint32_t>(target_global_offset + local_candidate);
+          auto global_candidate = static_cast<uint32_t>(target_global_offset + local_candidate);
+          insert_candidate(candidates,
+                           candidate_dists,
+                           opts.candidate_count,
+                           global_row,
+                           global_candidate,
+                           dist_host[out_row * opts.candidate_count + c]);
         }
       }
     }
@@ -566,30 +672,55 @@ void generate_query_candidates(raft::device_resources const& res,
                                const std::vector<uint8_t>& selected,
                                std::vector<uint32_t>& candidates)
 {
-  std::filesystem::path root(opts.split_dir);
-  auto part0_rows = static_cast<size_t>(split.part0.rows);
-  auto part1_rows = static_cast<size_t>(split.part1.rows);
-  auto part0_selected = selected_local_rows(selected, 0, part0_rows);
-  auto part1_selected = selected_local_rows(selected, part0_rows, part1_rows);
+  if (opts.candidate_count == 0) return;
 
-  query_other_partition(res,
-                        opts,
-                        root / "part_001" / "index.cag",
-                        split.part0,
-                        0,
-                        part0_rows,
-                        part1_rows,
-                        part0_selected,
-                        candidates);
-  query_other_partition(res,
-                        opts,
-                        root / "part_000" / "index.cag",
-                        split.part1,
-                        part0_rows,
-                        0,
-                        part0_rows,
-                        part1_selected,
-                        candidates);
+  std::vector<std::vector<size_t>> selected_by_part;
+  selected_by_part.reserve(split.parts.size());
+  for (const auto& part : split.parts) {
+    selected_by_part.push_back(selected_local_rows(selected, part.global_offset, part.data.rows));
+  }
+
+  std::vector<float> candidate_dists(candidates.size(), std::numeric_limits<float>::infinity());
+  if (opts.candidates == candidate_strategy::query_one) {
+    for (size_t source_id = 0; source_id < split.parts.size(); ++source_id) {
+      size_t target_id = (source_id + 1) % split.parts.size();
+      const auto& source = split.parts[source_id];
+      const auto& target = split.parts[target_id];
+      cuvs::neighbors::cagra::index<float, uint32_t> target_index(res);
+      cuvs::neighbors::cagra::deserialize(res, (target.dir / "index.cag").string(), &target_index);
+      query_partition_with_index(res,
+                                 opts,
+                                 target_index,
+                                 source.data,
+                                 source.global_offset,
+                                 target.global_offset,
+                                 target.data.rows,
+                                 selected_by_part[source_id],
+                                 candidates,
+                                 candidate_dists);
+    }
+    return;
+  }
+
+  for (size_t target_id = 0; target_id < split.parts.size(); ++target_id) {
+    const auto& target = split.parts[target_id];
+    cuvs::neighbors::cagra::index<float, uint32_t> target_index(res);
+    cuvs::neighbors::cagra::deserialize(res, (target.dir / "index.cag").string(), &target_index);
+    for (size_t source_id = 0; source_id < split.parts.size(); ++source_id) {
+      if (source_id == target_id) continue;
+      const auto& source = split.parts[source_id];
+      query_partition_with_index(res,
+                                 opts,
+                                 target_index,
+                                 source.data,
+                                 source.global_offset,
+                                 target.global_offset,
+                                 target.data.rows,
+                                 selected_by_part[source_id],
+                                 candidates,
+                                 candidate_dists);
+    }
+  }
 }
 
 float l2_distance(const std::vector<float>& dataset, size_t dim, size_t lhs, size_t rhs)
@@ -678,24 +809,32 @@ std::vector<size_t> replacement_positions(const options& opts,
 
 std::vector<uint32_t> build_seed_graph(const options& opts,
                                        const loaded_split& split,
-                                       const graph_copy& part0_graph,
-                                       const graph_copy& part1_graph,
+                                       const std::vector<graph_copy>& part_graphs,
                                        const std::vector<uint32_t>& candidates,
                                        const std::vector<uint8_t>& selected,
                                        const std::vector<float>& combined_host,
                                        size_t& seed_degree)
 {
-  if (part0_graph.degree != part1_graph.degree) {
-    throw std::runtime_error("Partition graph degrees differ");
+  if (part_graphs.size() != split.parts.size()) {
+    throw std::runtime_error("Partition graph count does not match split parts");
   }
-  size_t total_rows  = static_cast<size_t>(split.part0.rows) + split.part1.rows;
-  size_t base_degree = part0_graph.degree;
-  seed_degree        = base_degree + (opts.insertion == insert_mode::append ? opts.candidate_count : 0);
-  seed_degree        = std::max<size_t>(seed_degree, 1);
+  if (part_graphs.empty()) { throw std::runtime_error("No partition graphs loaded"); }
+  size_t base_degree = part_graphs.front().degree;
+  for (const auto& graph : part_graphs) {
+    if (graph.degree != base_degree) { throw std::runtime_error("Partition graph degrees differ"); }
+  }
+  size_t rows_total = total_rows(split);
+  seed_degree       = base_degree + (opts.insertion == insert_mode::append ? opts.candidate_count : 0);
+  seed_degree       = std::max<size_t>(seed_degree, 1);
 
-  std::vector<uint32_t> seed_graph(total_rows * seed_degree, invalid_id);
-  fill_base_seed_rows(part0_graph, 0, split.part0.rows, seed_degree, seed_graph);
-  fill_base_seed_rows(part1_graph, split.part0.rows, split.part1.rows, seed_degree, seed_graph);
+  std::vector<uint32_t> seed_graph(rows_total * seed_degree, invalid_id);
+  for (size_t part_id = 0; part_id < split.parts.size(); ++part_id) {
+    fill_base_seed_rows(part_graphs[part_id],
+                        split.parts[part_id].global_offset,
+                        split.parts[part_id].data.rows,
+                        seed_degree,
+                        seed_graph);
+  }
 
   if (opts.candidates == candidate_strategy::none || opts.candidate_count == 0) { return seed_graph; }
 
@@ -703,11 +842,11 @@ std::vector<uint32_t> build_seed_graph(const options& opts,
   replace_count        = std::min(replace_count, base_degree);
 
 #pragma omp parallel for
-  for (size_t row = 0; row < total_rows; ++row) {
+  for (size_t row = 0; row < rows_total; ++row) {
     if (!selected[row]) continue;
     uint32_t* existing = seed_graph.data() + row * seed_degree;
     auto unique = unique_valid_candidates(
-      candidates, row, opts.candidate_count, total_rows, existing, base_degree);
+      candidates, row, opts.candidate_count, rows_total, existing, base_degree);
     if (unique.empty()) continue;
 
     if (opts.insertion == insert_mode::append) {
@@ -719,7 +858,7 @@ std::vector<uint32_t> build_seed_graph(const options& opts,
       size_t n_replace = std::min(unique.size(), replace_count);
       if (n_replace == 0) continue;
       auto positions = replacement_positions(
-        opts, combined_host, split.part0.dim, row, existing, base_degree, n_replace);
+        opts, combined_host, split.dim, row, existing, base_degree, n_replace);
       for (size_t i = 0; i < n_replace; ++i) {
         existing[positions[i]] = unique[i];
       }
@@ -945,7 +1084,7 @@ void append_csv(const options& opts,
                             metrics.variant.sort_ms + metrics.variant.optimize_ms +
                             metrics.variant.index_ms;
   out << std::fixed << std::setprecision(6)
-      << opts.label << ',' << (static_cast<size_t>(split.part0.rows) + split.part1.rows) << ','
+      << opts.label << ',' << total_rows(split) << ','
       << split.queries.rows << ',' << opts.topk << ',' << opts.graph_degree << ','
       << opts.intermediate_graph_degree << ',' << seed_degree << ',' << to_string(opts.candidates)
       << ',' << to_string(opts.insertion) << ',' << to_string(opts.replacement) << ','
@@ -974,19 +1113,19 @@ int main(int argc, char** argv)
 
     std::cout << "Loading split data from " << opts.split_dir << "\n";
     auto split = load_split(opts);
-    size_t total_rows = static_cast<size_t>(split.part0.rows) + split.part1.rows;
-    if (opts.topk > static_cast<int64_t>(total_rows)) {
+    size_t rows_total = total_rows(split);
+    if (opts.topk > static_cast<int64_t>(rows_total)) {
       throw std::runtime_error("--topk must be <= total rows");
     }
-    auto combined_host = concatenate(split.part0, split.part1);
-    auto selected      = make_selection(opts, total_rows);
+    auto combined_host = concatenate(split);
+    auto selected      = make_selection(opts, rows_total);
     size_t n_selected  = count_selected(selected);
 
-    std::cout << "Rows=" << total_rows << " queries=" << split.queries.rows
-              << " selected=" << n_selected << "\n";
+    std::cout << "Rows=" << rows_total << " parts=" << part_count(split)
+              << " queries=" << split.queries.rows << " selected=" << n_selected << "\n";
 
     auto combined_dev = copy_to_device(
-      res, combined_host, static_cast<uint32_t>(total_rows), split.part0.dim);
+      res, combined_host, static_cast<uint32_t>(rows_total), split.dim);
     auto queries_dev = copy_to_device(res, split.queries);
 
     run_metrics metrics;
@@ -1008,24 +1147,24 @@ int main(int argc, char** argv)
 
     size_t seed_degree = 0;
     if (!opts.skip_variant) {
-      std::filesystem::path root(opts.split_dir);
-      graph_copy part0_graph;
-      graph_copy part1_graph;
+      std::vector<graph_copy> part_graphs;
+      part_graphs.reserve(split.parts.size());
       metrics.variant.load_graph_ms = elapsed_ms(clock_type::now(), clock_type::now());
       auto load_start = clock_type::now();
-      std::cout << "Loading partition CAGRA graphs\n";
-      part0_graph = load_partition_graph(res, root / "part_000" / "index.cag", split.part0.rows);
-      part1_graph = load_partition_graph(res, root / "part_001" / "index.cag", split.part1.rows);
+      std::cout << "Loading " << split.parts.size() << " partition CAGRA graphs\n";
+      for (const auto& part : split.parts) {
+        part_graphs.push_back(load_partition_graph(res, part.dir / "index.cag", part.data.rows));
+      }
       metrics.variant.load_graph_ms = elapsed_ms(load_start, clock_type::now());
 
-      auto candidates = make_empty_candidates(total_rows, opts.candidate_count);
+      auto candidates = make_empty_candidates(rows_total, opts.candidate_count);
       auto candidate_start = clock_type::now();
       if (opts.candidates == candidate_strategy::random_global) {
         std::cout << "Generating random global candidates\n";
-        generate_random_candidates(opts, total_rows, candidates, selected);
+        generate_random_candidates(opts, rows_total, candidates, selected);
       } else if (opts.candidates == candidate_strategy::query_one ||
                  opts.candidates == candidate_strategy::query_all) {
-        std::cout << "Generating candidates by querying the opposite partition index\n";
+        std::cout << "Generating query candidates across partition indexes\n";
         generate_query_candidates(res, opts, split, selected, candidates);
       }
       raft::resource::sync_stream(res);
@@ -1033,13 +1172,13 @@ int main(int argc, char** argv)
 
       std::cout << "Building seeded initial graph\n";
       auto seed_start = clock_type::now();
-      auto seed_graph = build_seed_graph(
-        opts, split, part0_graph, part1_graph, candidates, selected, combined_host, seed_degree);
+      auto seed_graph =
+        build_seed_graph(opts, split, part_graphs, candidates, selected, combined_host, seed_degree);
       metrics.variant.seed_ms = elapsed_ms(seed_start, clock_type::now());
 
       auto knn_graph = raft::make_host_matrix<uint32_t, int64_t, raft::row_major>(0, 0);
       if (opts.skip_nnd) {
-        knn_graph = seed_to_host_graph(seed_graph, total_rows, seed_degree, opts.seed);
+        knn_graph = seed_to_host_graph(seed_graph, rows_total, seed_degree, opts.seed);
         if (opts.skip_optimize) {
           std::cout << "Skipping NN-Descent and CAGRA optimize; searching mixed seed graph directly\n";
         } else {
@@ -1075,7 +1214,7 @@ int main(int argc, char** argv)
       } else {
         std::cout << "Optimizing CAGRA graph\n";
         auto optimized_graph = raft::make_host_matrix<uint32_t, int64_t, raft::row_major>(
-          static_cast<int64_t>(total_rows), static_cast<int64_t>(opts.graph_degree));
+          static_cast<int64_t>(rows_total), static_cast<int64_t>(opts.graph_degree));
         metrics.variant.optimize_ms = time_cuda(res, [&] {
           cuvs::neighbors::cagra::helpers::optimize(res, knn_graph.view(), optimized_graph.view());
         });
