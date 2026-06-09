@@ -1,0 +1,17 @@
+rows,algo,run,build_ms
+100000,ivf_pq,0,693.9
+100000,nn_descent,0,863.1
+250000,ivf_pq,0,1125.8
+250000,nn_descent,0,2203.9
+500000,ivf_pq,0,1699.4
+500000,nn_descent,0,4398.6
+1000000,ivf_pq,0,2939.6
+1000000,nn_descent,0,8709.7
+2000000,ivf_pq,0,6121.3
+2000000,nn_descent,0,17482.3
+4000000,ivf_pq,0,12100.2
+4000000,nn_descent,0,35590.3
+8000000,ivf_pq,0,27559.6
+8000000,nn_descent,0,nan
+10000000,ivf_pq,0,37753.4
+10000000,nn_descent,0,nan
