@@ -24,6 +24,8 @@ The harness loads the split partition indexes, builds an initial merged graph fr
 
 CSV output: `/raid/blandrum/split-wiki/merge_construction_results.csv`
 
+Figure: ![Append-k recall and build time](cagra_append_k_recall_build.png)
+
 Important timing note: `variant_build_ms` includes partition index deserialization / graph loading (`load_graph_ms`). A production merge API receiving already-live indexes should compare against `variant_build_ms - load_graph_ms`.
 
 ## Full-Size Results
@@ -99,6 +101,8 @@ These runs use direct optimize (`--skip-nnd`) with query candidates and full-row
 | 4 | 64 | 11346.589 | 8189.255 | 0.977783 |
 | 8 | 8 | 7052.322 | 3700.404 | 0.980325 |
 | 8 | 16 | 7775.009 | 4418.915 | 0.980533 |
+| 16 | 16 | 8350.410 | 4484.880 | 0.980933 |
+| 32 | 32 | 10652.506 | 5803.232 | 0.981275 |
 | 8 | 64 | 11560.185 | 8221.669 | 0.979933 |
 
 Beam-width takeaway: increasing candidate search beam helps a little up to about 8-16, but recall saturates quickly and larger beams mostly increase candidate search time. Returning more appended candidates has a larger effect than widening the beam after a modest value.
