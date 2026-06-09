@@ -42,6 +42,9 @@ Selected merge-construction variants:
 | `full_seed_partition_only_iter5` | none + seeded NN-Descent | append | 1.00 | 0 | n/a | 26069.747 | 23803.210 | 97.997 | 0.919367 | Lower iterations too low recall |
 | `full_random_append32_iter5` | random-global + seeded NN-Descent | append | 1.00 | 32 | n/a | 30511.640 | 28284.547 | 99.247 | 0.736817 | Random candidates did not help low-iter NN-Descent |
 | `full_nnd_query_append2_canditopk2_iter5` | query opposite index + seeded NN-Descent | append | 1.00 | 2 | 2 | 29454.267 | 27272.807 | 63.568 | 0.951317 | Query candidates help vs random but still below scratch and slow |
+| `full_nnd_query_append2_canditopk2_iter1` | query opposite index + seeded NN-Descent | append | 1.00 | 2 | 2 | 23242.754 | 19245.984 | 64.673 | 0.863100 | Minimal NN-Descent damages the direct seed graph |
+| `full_nnd_query_append2_canditopk2_iter2` | query opposite index + seeded NN-Descent | append | 1.00 | 2 | 2 | 23248.985 | 20968.159 | 64.565 | 0.880533 | Still far below direct optimize |
+| `full_nnd_query_append2_canditopk2_iter3` | query opposite index + seeded NN-Descent | append | 1.00 | 2 | 2 | 25276.628 | 23018.565 | 64.358 | 0.901983 | Improves slowly, still below scratch/direct |
 | `full_direct_partition_only` | none, direct optimize | append | 1.00 | 0 | n/a | 2844.602 | 627.699 | 92.715 | 0.489600 | Fast but disconnected across partitions |
 | `full_direct_random_append32` | random-global, direct optimize | append | 1.00 | 32 | n/a | 4978.102 | 2754.907 | 99.081 | 0.501500 | Random global edges insufficient |
 | `full_direct_query_append1_canditopk1` | query opposite index, direct optimize | append | 1.00 | 1 | 1 | 6024.142 | 3781.620 | 60.546 | 0.971725 | Just below scratch recall |
@@ -57,9 +60,31 @@ Selected merge-construction variants:
 | `full_direct_query_replace8_farthest_sample10` | query opposite index, direct optimize | replace | 0.10 | 8 | 64 | 54774.543 | 52586.737 | 60.187 | 0.966167 | CPU distance ranking dominates |
 | `full_direct_query_replace8_nearest_sample10` | query opposite index, direct optimize | replace | 0.10 | 8 | 64 | 55520.264 | 53296.153 | 60.325 | 0.965692 | No quality win; also very expensive |
 
+## Candidate Beam Sweep
+
+These runs use direct optimize (`--skip-nnd`) with query candidates and full-row append. `Candidate itopk` is the CAGRA search beam used while querying the other partition index to generate candidates.
+
+| Appended candidates | Candidate itopk | Build ms | Candidate ms | Recall@12 |
+|---:|---:|---:|---:|---:|
+| 1 | 1 | 6024.142 | 3069.753 | 0.971725 |
+| 2 | 2 | 6171.050 | 3159.222 | 0.975108 |
+| 2 | 4 | 6400.927 | 3366.378 | 0.976317 |
+| 2 | 8 | 6643.911 | 3663.194 | 0.976617 |
+| 2 | 16 | 7316.540 | 4346.267 | 0.976642 |
+| 2 | 64 | 11210.872 | 8233.866 | 0.976167 |
+| 4 | 4 | 6432.502 | 3342.929 | 0.977417 |
+| 4 | 8 | 6724.300 | 3649.936 | 0.978083 |
+| 4 | 16 | 7651.286 | 4472.028 | 0.978333 |
+| 4 | 64 | 11346.589 | 8189.255 | 0.977783 |
+| 8 | 8 | 7052.322 | 3700.404 | 0.980325 |
+| 8 | 16 | 7775.009 | 4418.915 | 0.980533 |
+| 8 | 64 | 11560.185 | 8221.669 | 0.979933 |
+
+Beam-width takeaway: increasing candidate search beam helps a little up to about 8-16, but recall saturates quickly and larger beams mostly increase candidate search time. Returning more appended candidates has a larger effect than widening the beam after a modest value.
+
 ## Findings So Far
 
-- Seeded NN-Descent is not competitive with the current IVF-PQ scratch baseline on this dataset. It can produce high recall (`0.982858`), but the 20-iteration run spends `54.8 s` in NN-Descent alone. Five iterations are faster but recall is too low, even with query-generated candidates (`0.951317`).
+- Seeded NN-Descent is not competitive with the current IVF-PQ scratch baseline on this dataset. It can produce high recall (`0.982858`), but the 20-iteration run spends `54.8 s` in NN-Descent alone. One to three iterations actively degrade the strong direct query-append seed graph (`0.863100`, `0.880533`, `0.901983` recall@12), and five iterations is still below scratch even with query-generated candidates (`0.951317`).
 - Direct optimize with informed cross-partition candidates is the strongest path so far. Querying the opposite partition index for every row and appending 2 to 8 candidates produces scratch-comparable or better recall, with merged-index search around `60 ms` versus `91.8 ms` for the scratch IVF-PQ index and `152.5 ms` for query-time split merge.
 - Random global candidates are ineffective for direct optimization and low-iteration NN-Descent on this split. Recall stays near `0.50` direct and `0.74` with five NN-Descent iterations.
 - Sampling rows hurts direct-query append quality. At 75% sampling, append32 nearly matches scratch (`0.974125` vs `0.974558`), but it is still slower than scratch. Lower samples are clearly below scratch recall.
