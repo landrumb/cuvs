@@ -43,7 +43,16 @@ namespace {
 using clock_type = std::chrono::steady_clock;
 constexpr uint32_t invalid_id = std::numeric_limits<uint32_t>::max();
 
-enum class candidate_strategy { none, random_global, query_one, query_window, query_sampled, query_routed, query_all };
+enum class candidate_strategy {
+  none,
+  random_global,
+  query_one,
+  query_window,
+  query_sampled,
+  query_routed,
+  query_boundary,
+  query_all
+};
 enum class insert_mode { replace, append };
 enum class replace_policy { random, farthest, nearest };
 enum class scratch_algo { nn_descent, ivf_pq, auto_select };
@@ -66,6 +75,8 @@ struct options {
   size_t query_batch_size = 10000;
   size_t query_window_size = 2;
   size_t target_sample_rows = 1024;
+  size_t boundary_light_count = 8;
+  double boundary_fraction = 0.5;
   size_t rows_per_part = 0;
   size_t query_count = 0;
   size_t part_start = 0;
@@ -161,7 +172,7 @@ Options:
   --intermediate-graph-degree <int>
                                  NND/CAGRA input graph degree (default 128)
   --candidate-count <int>        Candidates generated per modified row (default 32)
-  --candidate-strategy <none|random-global|query-one|query-window|query-sampled|query-routed|query-all>
+  --candidate-strategy <none|random-global|query-one|query-window|query-sampled|query-routed|query-boundary|query-all>
   --insert-mode <replace|append>
   --replace-policy <random|farthest|nearest>
   --replace-fraction <float>     Fraction of base neighbors to replace (default 0.25)
@@ -173,6 +184,8 @@ Options:
   --query-batch-size <int>       Candidate-generation query batch size (default 10000)
   --query-window-size <int>      Number of target partitions for query-window/query-sampled/query-routed (default 2)
   --target-sample-rows <int>      Rows per source part for query-sampled routing (default 1024)
+  --boundary-light-count <int>    Light cross-search k for query-boundary (default 8)
+  --boundary-fraction <float>     Fraction of selected rows receiving full query-boundary search (default 0.5)
   --rows-per-part <int>          Use first N rows from each part for quick sanity runs
   --query-count <int>            Use first N queries for quick sanity runs
   --part-start <int>             First sorted part_* directory to load (default 0)
@@ -209,6 +222,10 @@ candidate_strategy parse_candidate_strategy(const std::string& value)
   if (value == "query-window" || value == "window") return candidate_strategy::query_window;
   if (value == "query-sampled" || value == "sampled-targets") return candidate_strategy::query_sampled;
   if (value == "query-routed" || value == "routed") return candidate_strategy::query_routed;
+  if (value == "query-boundary" || value == "query-lowcross" || value == "lowcross" ||
+      value == "boundary") {
+    return candidate_strategy::query_boundary;
+  }
   if (value == "query-all" || value == "all-indices") return candidate_strategy::query_all;
   throw std::runtime_error("Invalid --candidate-strategy");
 }
@@ -245,6 +262,7 @@ std::string to_string(candidate_strategy value)
     case candidate_strategy::query_window: return "query-window";
     case candidate_strategy::query_sampled: return "query-sampled";
     case candidate_strategy::query_routed: return "query-routed";
+    case candidate_strategy::query_boundary: return "query-boundary";
     case candidate_strategy::query_all: return "query-all";
   }
   return "unknown";
@@ -325,6 +343,10 @@ options parse_args(int argc, char** argv)
       opts.query_window_size = static_cast<size_t>(parse_u64(need_value(arg), arg));
     } else if (arg == "--target-sample-rows") {
       opts.target_sample_rows = static_cast<size_t>(parse_u64(need_value(arg), arg));
+    } else if (arg == "--boundary-light-count") {
+      opts.boundary_light_count = static_cast<size_t>(parse_u64(need_value(arg), arg));
+    } else if (arg == "--boundary-fraction") {
+      opts.boundary_fraction = parse_f64(need_value(arg), arg);
     } else if (arg == "--rows-per-part") {
       opts.rows_per_part = static_cast<size_t>(parse_u64(need_value(arg), arg));
     } else if (arg == "--query-count") {
@@ -367,6 +389,10 @@ options parse_args(int argc, char** argv)
   if (opts.query_batch_size == 0) { throw std::runtime_error("--query-batch-size must be > 0"); }
   if (opts.query_window_size == 0) { throw std::runtime_error("--query-window-size must be > 0"); }
   if (opts.target_sample_rows == 0) { throw std::runtime_error("--target-sample-rows must be > 0"); }
+  if (opts.boundary_light_count == 0) { throw std::runtime_error("--boundary-light-count must be > 0"); }
+  if (opts.boundary_fraction < 0.0 || opts.boundary_fraction > 1.0) {
+    throw std::runtime_error("--boundary-fraction must be in [0, 1]");
+  }
   if (opts.output_csv.empty()) {
     opts.output_csv = (std::filesystem::path(opts.split_dir) / "merge_construction_results.csv").string();
   }
@@ -840,21 +866,26 @@ void query_partition_with_index(
   size_t target_rows_limit,
   const std::vector<size_t>& selected_rows,
   std::vector<uint32_t>& candidates,
-  std::vector<float>& candidate_dists)
+  std::vector<float>& candidate_dists,
+  size_t result_count = 0,
+  bool insert_results = true,
+  std::vector<float>* nearest_dist = nullptr,
+  std::vector<float>* farthest_dist = nullptr)
 {
-  if (selected_rows.empty() || opts.candidate_count == 0) return;
+  if (result_count == 0) { result_count = opts.candidate_count; }
+  if (selected_rows.empty() || result_count == 0) return;
 
   cuvs::neighbors::cagra::search_params search_params;
   size_t candidate_itopk = opts.candidate_itopk_size == 0 ? opts.itopk_size : opts.candidate_itopk_size;
-  search_params.itopk_size = std::max(candidate_itopk, opts.candidate_count);
+  search_params.itopk_size = std::max(candidate_itopk, result_count);
 
   std::vector<float> batch_host;
   for (size_t begin = 0; begin < selected_rows.size(); begin += opts.query_batch_size) {
     size_t rows = std::min(opts.query_batch_size, selected_rows.size() - begin);
     fill_query_batch(query_part, selected_rows, begin, rows, batch_host);
     auto batch_dev = copy_to_device(res, batch_host, static_cast<uint32_t>(rows), query_part.dim);
-    auto neigh     = raft::make_device_matrix<uint32_t, int64_t>(res, rows, opts.candidate_count);
-    auto dist      = raft::make_device_matrix<float, int64_t>(res, rows, opts.candidate_count);
+    auto neigh     = raft::make_device_matrix<uint32_t, int64_t>(res, rows, result_count);
+    auto dist      = raft::make_device_matrix<float, int64_t>(res, rows, result_count);
 
     cuvs::neighbors::cagra::search(res,
                                    search_params,
@@ -867,20 +898,68 @@ void query_partition_with_index(
     for (size_t out_row = 0; out_row < rows; ++out_row) {
       size_t local_row  = selected_rows[begin + out_row];
       size_t global_row = query_global_offset + local_row;
-      for (size_t c = 0; c < opts.candidate_count; ++c) {
-        uint32_t local_candidate = neigh_host[out_row * opts.candidate_count + c];
+      for (size_t c = 0; c < result_count; ++c) {
+        uint32_t local_candidate = neigh_host[out_row * result_count + c];
         if (local_candidate < target_rows_limit) {
-          auto global_candidate = static_cast<uint32_t>(target_global_offset + local_candidate);
-          insert_candidate(candidates,
-                           candidate_dists,
-                           opts.candidate_count,
-                           global_row,
-                           global_candidate,
-                           dist_host[out_row * opts.candidate_count + c]);
+          float candidate_dist = dist_host[out_row * result_count + c];
+          if (nearest_dist != nullptr && candidate_dist < (*nearest_dist)[global_row]) {
+            (*nearest_dist)[global_row] = candidate_dist;
+          }
+          if (farthest_dist != nullptr && candidate_dist > (*farthest_dist)[global_row]) {
+            (*farthest_dist)[global_row] = candidate_dist;
+          }
+          if (insert_results) {
+            auto global_candidate = static_cast<uint32_t>(target_global_offset + local_candidate);
+            insert_candidate(candidates,
+                             candidate_dists,
+                             opts.candidate_count,
+                             global_row,
+                             global_candidate,
+                             candidate_dist);
+          }
         }
       }
     }
   }
+}
+
+std::vector<uint8_t> select_boundary_rows(const std::vector<uint8_t>& selected,
+                                          const std::vector<float>& nearest_cross,
+                                          const std::vector<float>& farthest_within,
+                                          double boundary_fraction)
+{
+  std::vector<uint8_t> boundary(selected.size(), 0);
+  if (boundary_fraction <= 0.0) return boundary;
+
+  std::vector<std::pair<float, size_t>> scored;
+  scored.reserve(selected.size());
+  for (size_t row = 0; row < selected.size(); ++row) {
+    if (!selected[row]) continue;
+    float nearest = nearest_cross[row];
+    float farthest = farthest_within[row];
+    float score = std::numeric_limits<float>::infinity();
+    if (std::isfinite(nearest) && std::isfinite(farthest) && farthest > 0.0f) {
+      score = nearest / farthest;
+    }
+    scored.emplace_back(score, row);
+  }
+  if (scored.empty()) return boundary;
+
+  size_t boundary_count = static_cast<size_t>(std::ceil(scored.size() * boundary_fraction));
+  boundary_count = std::min(boundary_count, scored.size());
+  if (boundary_count == 0) return boundary;
+
+  auto by_score = [](const auto& lhs, const auto& rhs) {
+    if (lhs.first == rhs.first) return lhs.second < rhs.second;
+    return lhs.first < rhs.first;
+  };
+  if (boundary_count < scored.size()) {
+    std::nth_element(scored.begin(), scored.begin() + boundary_count, scored.end(), by_score);
+  }
+  for (size_t i = 0; i < boundary_count; ++i) {
+    boundary[scored[i].second] = 1;
+  }
+  return boundary;
 }
 
 void generate_query_candidates(raft::device_resources const& res,
@@ -900,6 +979,102 @@ void generate_query_candidates(raft::device_resources const& res,
   std::vector<float> candidate_dists(candidates.size(), std::numeric_limits<float>::infinity());
   const size_t n_parts = split.parts.size();
   const size_t window_size = std::min(opts.query_window_size, n_parts - 1);
+
+  if (opts.candidates == candidate_strategy::query_boundary) {
+    size_t light_count = std::min(opts.boundary_light_count, opts.candidate_count);
+    if (light_count == 0) return;
+
+    bool score_boundary = opts.boundary_fraction > 0.0;
+    std::vector<float> nearest_cross;
+    std::vector<float> farthest_within;
+    if (score_boundary) {
+      nearest_cross.assign(total_rows(split), std::numeric_limits<float>::infinity());
+      farthest_within.assign(total_rows(split), 0.0f);
+      for (size_t source_id = 0; source_id < n_parts; ++source_id) {
+        const auto& source = split.parts[source_id];
+        cuvs::neighbors::cagra::index<float, uint32_t> source_index(res);
+        cuvs::neighbors::cagra::deserialize(res, (source.dir / "index.cag").string(), &source_index);
+        query_partition_with_index(res,
+                                   opts,
+                                   source_index,
+                                   source.data,
+                                   source.global_offset,
+                                   source.global_offset,
+                                   source.data.rows,
+                                   selected_by_part[source_id],
+                                   candidates,
+                                   candidate_dists,
+                                   light_count,
+                                   false,
+                                   nullptr,
+                                   &farthest_within);
+      }
+    }
+
+    for (size_t target_id = 0; target_id < n_parts; ++target_id) {
+      const auto& target = split.parts[target_id];
+      cuvs::neighbors::cagra::index<float, uint32_t> target_index(res);
+      cuvs::neighbors::cagra::deserialize(res, (target.dir / "index.cag").string(), &target_index);
+      for (size_t source_id = 0; source_id < n_parts; ++source_id) {
+        if (source_id == target_id) continue;
+        const auto& source = split.parts[source_id];
+        query_partition_with_index(res,
+                                   opts,
+                                   target_index,
+                                   source.data,
+                                   source.global_offset,
+                                   target.global_offset,
+                                   target.data.rows,
+                                   selected_by_part[source_id],
+                                   candidates,
+                                   candidate_dists,
+                                   light_count,
+                                   true,
+                                   score_boundary ? &nearest_cross : nullptr,
+                                   nullptr);
+      }
+    }
+
+    if (!score_boundary) {
+      std::cout << "query_boundary_rows=0 light_count=" << light_count
+                << " full_count=" << opts.candidate_count << "\n";
+      return;
+    }
+
+    auto boundary = select_boundary_rows(
+      selected, nearest_cross, farthest_within, opts.boundary_fraction);
+    size_t boundary_count = count_selected(boundary);
+    std::vector<std::vector<size_t>> boundary_by_part;
+    boundary_by_part.reserve(split.parts.size());
+    for (const auto& part : split.parts) {
+      boundary_by_part.push_back(selected_local_rows(boundary, part.global_offset, part.data.rows));
+    }
+    std::cout << "query_boundary_rows=" << boundary_count
+              << " light_count=" << light_count
+              << " full_count=" << opts.candidate_count << "\n";
+
+    if (boundary_count == 0) return;
+    for (size_t target_id = 0; target_id < n_parts; ++target_id) {
+      const auto& target = split.parts[target_id];
+      cuvs::neighbors::cagra::index<float, uint32_t> target_index(res);
+      cuvs::neighbors::cagra::deserialize(res, (target.dir / "index.cag").string(), &target_index);
+      for (size_t source_id = 0; source_id < n_parts; ++source_id) {
+        if (source_id == target_id) continue;
+        const auto& source = split.parts[source_id];
+        query_partition_with_index(res,
+                                   opts,
+                                   target_index,
+                                   source.data,
+                                   source.global_offset,
+                                   target.global_offset,
+                                   target.data.rows,
+                                   boundary_by_part[source_id],
+                                   candidates,
+                                   candidate_dists);
+      }
+    }
+    return;
+  }
 
   std::vector<std::vector<uint8_t>> sampled_targets;
   if (opts.candidates == candidate_strategy::query_sampled) {
@@ -1518,6 +1693,7 @@ int main(int argc, char** argv)
                  opts.candidates == candidate_strategy::query_window ||
                  opts.candidates == candidate_strategy::query_sampled ||
                  opts.candidates == candidate_strategy::query_routed ||
+                 opts.candidates == candidate_strategy::query_boundary ||
                  opts.candidates == candidate_strategy::query_all) {
         std::cout << "Generating query candidates across partition indexes\n";
         generate_query_candidates(res, opts, split, selected, candidates);
