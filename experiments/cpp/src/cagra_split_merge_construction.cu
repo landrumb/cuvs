@@ -66,6 +66,7 @@ struct options {
   size_t graph_degree = 64;
   size_t intermediate_graph_degree = 128;
   size_t candidate_count = 32;
+  size_t candidate_query_count = 0;
   double sample_rate = 1.0;
   double replace_fraction = 0.25;
   uint64_t seed = 1234;
@@ -171,7 +172,8 @@ Options:
   --graph-degree <int>           CAGRA optimized graph degree (default 64)
   --intermediate-graph-degree <int>
                                  NND/CAGRA input graph degree (default 128)
-  --candidate-count <int>        Candidates generated per modified row (default 32)
+  --candidate-count <int>        Candidate slots kept per modified row (default 32)
+  --candidate-query-count <int>  Query results requested per target partition (default candidate-count)
   --candidate-strategy <none|random-global|query-one|query-window|query-sampled|query-routed|query-boundary|query-all>
   --insert-mode <replace|append>
   --replace-policy <random|farthest|nearest>
@@ -319,6 +321,8 @@ options parse_args(int argc, char** argv)
       opts.intermediate_graph_degree = static_cast<size_t>(parse_u64(need_value(arg), arg));
     } else if (arg == "--candidate-count") {
       opts.candidate_count = static_cast<size_t>(parse_u64(need_value(arg), arg));
+    } else if (arg == "--candidate-query-count") {
+      opts.candidate_query_count = static_cast<size_t>(parse_u64(need_value(arg), arg));
     } else if (arg == "--candidate-strategy") {
       opts.candidates = parse_candidate_strategy(need_value(arg));
     } else if (arg == "--insert-mode") {
@@ -386,6 +390,7 @@ options parse_args(int argc, char** argv)
   if (opts.replace_fraction < 0.0 || opts.replace_fraction > 1.0) {
     throw std::runtime_error("--replace-fraction must be in [0, 1]");
   }
+  if (opts.candidate_query_count == 0) { opts.candidate_query_count = opts.candidate_count; }
   if (opts.query_batch_size == 0) { throw std::runtime_error("--query-batch-size must be > 0"); }
   if (opts.query_window_size == 0) { throw std::runtime_error("--query-window-size must be > 0"); }
   if (opts.target_sample_rows == 0) { throw std::runtime_error("--target-sample-rows must be > 0"); }
@@ -872,7 +877,7 @@ void query_partition_with_index(
   std::vector<float>* nearest_dist = nullptr,
   std::vector<float>* farthest_dist = nullptr)
 {
-  if (result_count == 0) { result_count = opts.candidate_count; }
+  if (result_count == 0) { result_count = opts.candidate_query_count; }
   if (selected_rows.empty() || result_count == 0) return;
 
   cuvs::neighbors::cagra::search_params search_params;
@@ -1070,7 +1075,8 @@ void generate_query_candidates(raft::device_resources const& res,
                                    target.data.rows,
                                    boundary_by_part[source_id],
                                    candidates,
-                                   candidate_dists);
+                                   candidate_dists,
+                                   opts.candidate_count);
       }
     }
     return;
