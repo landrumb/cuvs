@@ -82,6 +82,7 @@ struct options {
   size_t query_count = 0;
   size_t part_start = 0;
   size_t part_count_limit = 0;
+  std::vector<size_t> part_ids;
   bool skip_scratch = false;
   bool skip_variant = false;
   bool skip_nnd = false;
@@ -190,8 +191,9 @@ Options:
   --boundary-fraction <float>     Fraction of selected rows receiving full query-boundary search (default 0.5)
   --rows-per-part <int>          Use first N rows from each part for quick sanity runs
   --query-count <int>            Use first N queries for quick sanity runs
-  --part-start <int>             First sorted part_* directory to load (default 0)
-  --part-count <int>             Number of sorted part_* directories to load (default all)
+  --part-start <int>             First numerically sorted part_* directory to load (default 0)
+  --part-count <int>             Number of numerically sorted part_* directories to load (default all)
+  --part-list <ids>              Comma-separated zero-based part indices to load in given order
   --scratch-algo <nn-descent|ivf-pq|auto>
   --skip-scratch                 Do not build/search from-scratch CAGRA baseline
   --skip-variant                 Only run brute force and optional scratch baseline
@@ -214,6 +216,27 @@ double parse_f64(const std::string& value, const std::string& flag)
   double value_ = std::strtod(value.c_str(), &end);
   if (end == value.c_str() || *end != '\0') { throw std::runtime_error("Invalid " + flag); }
   return value_;
+}
+
+std::vector<size_t> parse_part_list(const std::string& value)
+{
+  if (value.empty()) { throw std::runtime_error("--part-list must not be empty"); }
+
+  std::vector<size_t> ids;
+  size_t begin = 0;
+  while (begin <= value.size()) {
+    size_t end       = value.find(',', begin);
+    auto token       = value.substr(begin, end == std::string::npos ? end : end - begin);
+    if (token.empty()) { throw std::runtime_error("--part-list contains an empty entry"); }
+    auto id = static_cast<size_t>(parse_u64(token, "--part-list"));
+    if (std::find(ids.begin(), ids.end(), id) != ids.end()) {
+      throw std::runtime_error("--part-list contains a duplicate index");
+    }
+    ids.push_back(id);
+    if (end == std::string::npos) { break; }
+    begin = end + 1;
+  }
+  return ids;
 }
 
 candidate_strategy parse_candidate_strategy(const std::string& value)
@@ -359,6 +382,8 @@ options parse_args(int argc, char** argv)
       opts.part_start = static_cast<size_t>(parse_u64(need_value(arg), arg));
     } else if (arg == "--part-count") {
       opts.part_count_limit = static_cast<size_t>(parse_u64(need_value(arg), arg));
+    } else if (arg == "--part-list") {
+      opts.part_ids = parse_part_list(need_value(arg));
     } else if (arg == "--scratch-algo") {
       opts.scratch = parse_scratch_algo(need_value(arg));
     } else if (arg == "--skip-scratch") {
@@ -397,6 +422,12 @@ options parse_args(int argc, char** argv)
   if (opts.boundary_light_count == 0) { throw std::runtime_error("--boundary-light-count must be > 0"); }
   if (opts.boundary_fraction < 0.0 || opts.boundary_fraction > 1.0) {
     throw std::runtime_error("--boundary-fraction must be in [0, 1]");
+  }
+  if (!opts.part_ids.empty()) {
+    if (opts.part_ids.size() < 2) { throw std::runtime_error("--part-list must select at least two parts"); }
+    if (opts.part_start != 0 || opts.part_count_limit != 0) {
+      throw std::runtime_error("--part-list is mutually exclusive with --part-start/--part-count");
+    }
   }
   if (opts.output_csv.empty()) {
     opts.output_csv = (std::filesystem::path(opts.split_dir) / "merge_construction_results.csv").string();
@@ -485,13 +516,24 @@ bool is_partition_dir(const std::filesystem::directory_entry& entry)
   return std::all_of(name.begin() + 5, name.end(), [](char c) { return c >= '0' && c <= '9'; });
 }
 
+uint64_t partition_dir_id(const std::filesystem::path& path)
+{
+  auto name = path.filename().string();
+  return parse_u64(name.substr(5), "partition directory");
+}
+
 std::vector<std::filesystem::path> partition_dirs(const std::filesystem::path& root)
 {
   std::vector<std::filesystem::path> dirs;
   for (const auto& entry : std::filesystem::directory_iterator(root)) {
     if (is_partition_dir(entry)) { dirs.push_back(entry.path()); }
   }
-  std::sort(dirs.begin(), dirs.end());
+  std::sort(dirs.begin(), dirs.end(), [](const auto& lhs, const auto& rhs) {
+    auto lhs_id = partition_dir_id(lhs);
+    auto rhs_id = partition_dir_id(rhs);
+    if (lhs_id != rhs_id) { return lhs_id < rhs_id; }
+    return lhs.filename().string() < rhs.filename().string();
+  });
   if (dirs.size() < 2) { throw std::runtime_error("Need at least two part_* directories"); }
   return dirs;
 }
@@ -509,15 +551,26 @@ loaded_split load_split(const options& opts)
   split.dim     = split.queries.dim;
 
   auto dirs = partition_dirs(root);
-  if (opts.part_start >= dirs.size()) { throw std::runtime_error("--part-start is out of range"); }
-  size_t end_part = dirs.size();
-  if (opts.part_count_limit > 0) {
-    end_part = std::min(end_part, opts.part_start + opts.part_count_limit);
+  std::vector<size_t> selected_part_ids;
+  if (!opts.part_ids.empty()) {
+    selected_part_ids = opts.part_ids;
+    for (size_t part_id : selected_part_ids) {
+      if (part_id >= dirs.size()) { throw std::runtime_error("--part-list index is out of range"); }
+    }
+  } else {
+    if (opts.part_start >= dirs.size()) { throw std::runtime_error("--part-start is out of range"); }
+    size_t end_part = dirs.size();
+    if (opts.part_count_limit > 0) {
+      end_part = std::min(end_part, opts.part_start + opts.part_count_limit);
+    }
+    for (size_t part_id = opts.part_start; part_id < end_part; ++part_id) {
+      selected_part_ids.push_back(part_id);
+    }
   }
-  if (end_part - opts.part_start < 2) { throw std::runtime_error("Need at least two selected parts"); }
+  if (selected_part_ids.size() < 2) { throw std::runtime_error("Need at least two selected parts"); }
 
   size_t offset = 0;
-  for (size_t part_id = opts.part_start; part_id < end_part; ++part_id) {
+  for (size_t part_id : selected_part_ids) {
     const auto& dir = dirs[part_id];
     split_part part;
     part.name          = dir.filename().string();
