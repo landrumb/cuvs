@@ -43,7 +43,7 @@ namespace {
 using clock_type = std::chrono::steady_clock;
 constexpr uint32_t invalid_id = std::numeric_limits<uint32_t>::max();
 
-enum class candidate_strategy { none, random_global, query_one, query_window, query_sampled, query_all };
+enum class candidate_strategy { none, random_global, query_one, query_window, query_sampled, query_routed, query_all };
 enum class insert_mode { replace, append };
 enum class replace_policy { random, farthest, nearest };
 enum class scratch_algo { nn_descent, ivf_pq, auto_select };
@@ -161,7 +161,7 @@ Options:
   --intermediate-graph-degree <int>
                                  NND/CAGRA input graph degree (default 128)
   --candidate-count <int>        Candidates generated per modified row (default 32)
-  --candidate-strategy <none|random-global|query-one|query-window|query-sampled|query-all>
+  --candidate-strategy <none|random-global|query-one|query-window|query-sampled|query-routed|query-all>
   --insert-mode <replace|append>
   --replace-policy <random|farthest|nearest>
   --replace-fraction <float>     Fraction of base neighbors to replace (default 0.25)
@@ -171,7 +171,7 @@ Options:
   --itopk-size <int>             Final CAGRA search itopk_size (default 64)
   --candidate-itopk-size <int>   Candidate-generation CAGRA search itopk_size
   --query-batch-size <int>       Candidate-generation query batch size (default 10000)
-  --query-window-size <int>      Number of target partitions for query-window/query-sampled (default 2)
+  --query-window-size <int>      Number of target partitions for query-window/query-sampled/query-routed (default 2)
   --target-sample-rows <int>      Rows per source part for query-sampled routing (default 1024)
   --rows-per-part <int>          Use first N rows from each part for quick sanity runs
   --query-count <int>            Use first N queries for quick sanity runs
@@ -208,6 +208,7 @@ candidate_strategy parse_candidate_strategy(const std::string& value)
   if (value == "query-one" || value == "one-index") return candidate_strategy::query_one;
   if (value == "query-window" || value == "window") return candidate_strategy::query_window;
   if (value == "query-sampled" || value == "sampled-targets") return candidate_strategy::query_sampled;
+  if (value == "query-routed" || value == "routed") return candidate_strategy::query_routed;
   if (value == "query-all" || value == "all-indices") return candidate_strategy::query_all;
   throw std::runtime_error("Invalid --candidate-strategy");
 }
@@ -243,6 +244,7 @@ std::string to_string(candidate_strategy value)
     case candidate_strategy::query_one: return "query-one";
     case candidate_strategy::query_window: return "query-window";
     case candidate_strategy::query_sampled: return "query-sampled";
+    case candidate_strategy::query_routed: return "query-routed";
     case candidate_strategy::query_all: return "query-all";
   }
   return "unknown";
@@ -746,6 +748,88 @@ double sampled_target_distance(
   return count == 0 ? std::numeric_limits<double>::infinity() : total / static_cast<double>(count);
 }
 
+void insert_route_target(std::vector<uint32_t>& route_targets,
+                         std::vector<float>& route_dists,
+                         size_t route_count,
+                         size_t row,
+                         uint32_t target_id,
+                         float dist)
+{
+  if (route_count == 0 || target_id == invalid_id) return;
+  auto base = row * route_count;
+  for (size_t c = 0; c < route_count; ++c) {
+    if (route_targets[base + c] == target_id) {
+      if (dist < route_dists[base + c]) { route_dists[base + c] = dist; }
+      return;
+    }
+  }
+
+  size_t slot = 0;
+  bool found_empty = false;
+  float worst_dist = -std::numeric_limits<float>::infinity();
+  for (size_t c = 0; c < route_count; ++c) {
+    if (route_targets[base + c] == invalid_id) {
+      slot = c;
+      found_empty = true;
+      break;
+    }
+    if (route_dists[base + c] > worst_dist) {
+      worst_dist = route_dists[base + c];
+      slot = c;
+    }
+  }
+  if (found_empty || dist < worst_dist) {
+    route_targets[base + slot] = target_id;
+    route_dists[base + slot] = dist;
+  }
+}
+
+void route_partition_with_index(
+  raft::device_resources const& res,
+  const options& opts,
+  const cuvs::neighbors::cagra::index<float, uint32_t>& target_index,
+  const fbin_matrix& query_part,
+  size_t query_global_offset,
+  size_t target_id,
+  const std::vector<size_t>& selected_rows,
+  std::vector<uint32_t>& route_targets,
+  std::vector<float>& route_dists,
+  size_t route_count)
+{
+  if (selected_rows.empty() || route_count == 0) return;
+
+  cuvs::neighbors::cagra::search_params search_params;
+  size_t candidate_itopk = opts.candidate_itopk_size == 0 ? opts.itopk_size : opts.candidate_itopk_size;
+  search_params.itopk_size = std::max<size_t>(candidate_itopk, 1);
+
+  std::vector<float> batch_host;
+  for (size_t begin = 0; begin < selected_rows.size(); begin += opts.query_batch_size) {
+    size_t rows = std::min(opts.query_batch_size, selected_rows.size() - begin);
+    fill_query_batch(query_part, selected_rows, begin, rows, batch_host);
+    auto batch_dev = copy_to_device(res, batch_host, static_cast<uint32_t>(rows), query_part.dim);
+    auto neigh     = raft::make_device_matrix<uint32_t, int64_t>(res, rows, 1);
+    auto dist      = raft::make_device_matrix<float, int64_t>(res, rows, 1);
+
+    cuvs::neighbors::cagra::search(res,
+                                   search_params,
+                                   target_index,
+                                   raft::make_const_mdspan(batch_dev.view()),
+                                   neigh.view(),
+                                   dist.view());
+    auto dist_host = copy_device_view_to_host<float>(res, dist.view());
+    for (size_t out_row = 0; out_row < rows; ++out_row) {
+      size_t local_row = selected_rows[begin + out_row];
+      size_t global_row = query_global_offset + local_row;
+      insert_route_target(route_targets,
+                          route_dists,
+                          route_count,
+                          global_row,
+                          static_cast<uint32_t>(target_id),
+                          dist_host[out_row]);
+    }
+  }
+}
+
 void query_partition_with_index(
   raft::device_resources const& res,
   const options& opts,
@@ -853,6 +937,48 @@ void generate_query_candidates(raft::device_resources const& res,
     }
   }
 
+  std::vector<std::vector<std::vector<size_t>>> routed_selected;
+  if (opts.candidates == candidate_strategy::query_routed) {
+    std::vector<uint32_t> route_targets(total_rows(split) * window_size, invalid_id);
+    std::vector<float> route_dists(route_targets.size(), std::numeric_limits<float>::infinity());
+    for (size_t target_id = 0; target_id < n_parts; ++target_id) {
+      const auto& target = split.parts[target_id];
+      cuvs::neighbors::cagra::index<float, uint32_t> target_index(res);
+      cuvs::neighbors::cagra::deserialize(res, (target.dir / "index.cag").string(), &target_index);
+      for (size_t source_id = 0; source_id < n_parts; ++source_id) {
+        if (source_id == target_id) continue;
+        const auto& source = split.parts[source_id];
+        route_partition_with_index(res,
+                                   opts,
+                                   target_index,
+                                   source.data,
+                                   source.global_offset,
+                                   target_id,
+                                   selected_by_part[source_id],
+                                   route_targets,
+                                   route_dists,
+                                   window_size);
+      }
+    }
+
+    routed_selected.resize(n_parts);
+    for (auto& by_source : routed_selected) {
+      by_source.resize(n_parts);
+    }
+    for (size_t source_id = 0; source_id < n_parts; ++source_id) {
+      const auto& source = split.parts[source_id];
+      for (size_t local_row : selected_by_part[source_id]) {
+        size_t global_row = source.global_offset + local_row;
+        for (size_t slot = 0; slot < window_size; ++slot) {
+          uint32_t target_id = route_targets[global_row * window_size + slot];
+          if (target_id != invalid_id && target_id < n_parts) {
+            routed_selected[target_id][source_id].push_back(local_row);
+          }
+        }
+      }
+    }
+  }
+
   auto should_query = [&](size_t source_id, size_t target_id) {
     if (source_id == target_id) return false;
     switch (opts.candidates) {
@@ -863,6 +989,7 @@ void generate_query_candidates(raft::device_resources const& res,
         return ring_delta >= 1 && ring_delta <= window_size;
       }
       case candidate_strategy::query_sampled: return sampled_targets[source_id][target_id] != 0;
+      case candidate_strategy::query_routed: return true;
       default: return false;
     }
   };
@@ -874,6 +1001,9 @@ void generate_query_candidates(raft::device_resources const& res,
     for (size_t source_id = 0; source_id < n_parts; ++source_id) {
       if (!should_query(source_id, target_id)) continue;
       const auto& source = split.parts[source_id];
+      const auto& rows_to_query = opts.candidates == candidate_strategy::query_routed
+                                    ? routed_selected[target_id][source_id]
+                                    : selected_by_part[source_id];
       query_partition_with_index(res,
                                  opts,
                                  target_index,
@@ -881,7 +1011,7 @@ void generate_query_candidates(raft::device_resources const& res,
                                  source.global_offset,
                                  target.global_offset,
                                  target.data.rows,
-                                 selected_by_part[source_id],
+                                 rows_to_query,
                                  candidates,
                                  candidate_dists);
     }
@@ -1387,6 +1517,7 @@ int main(int argc, char** argv)
       } else if (opts.candidates == candidate_strategy::query_one ||
                  opts.candidates == candidate_strategy::query_window ||
                  opts.candidates == candidate_strategy::query_sampled ||
+                 opts.candidates == candidate_strategy::query_routed ||
                  opts.candidates == candidate_strategy::query_all) {
         std::cout << "Generating query candidates across partition indexes\n";
         generate_query_candidates(res, opts, split, selected, candidates);
