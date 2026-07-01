@@ -10,6 +10,7 @@
 #include <raft/core/device_mdarray.hpp>
 #include <raft/core/device_mdspan.hpp>
 #include <raft/core/error.hpp>
+#include <raft/core/resource/cublas_handle.hpp>
 #include <raft/core/resource/cuda_stream.hpp>
 #include <raft/core/resources.hpp>
 #include <raft/util/cudart_utils.hpp>
@@ -29,15 +30,16 @@
 
 namespace cuvs::neighbors::cagra::detail::merge_scaffold {
 
-inline constexpr int k_degree                = 4;
-inline constexpr int k_cluster_size          = 128;
-inline constexpr int k_max_cluster           = 128;
-inline constexpr int k_pivot_assign_chunk    = 256;
-inline constexpr int k_leaf_assign_chunk     = 1024;
-inline constexpr int k_pivot_block_size      = 128;
-inline constexpr int k_max_pivot_tree_levels = 64;
-inline constexpr uint64_t k_seed             = 1234;
-inline constexpr float k_inf                 = 3.4028234663852886e38f;
+inline constexpr int k_degree                       = 4;
+inline constexpr int k_cluster_size                 = 128;
+inline constexpr int k_max_cluster                  = 128;
+inline constexpr int k_pivot_assign_chunk           = 256;
+inline constexpr int k_leaf_assign_chunk            = 1024;
+inline constexpr int k_pivot_block_size             = 128;
+inline constexpr int k_max_pivot_tree_levels        = 64;
+inline constexpr uint64_t k_seed                    = 1234;
+inline constexpr float k_inf                        = 3.4028234663852886e38f;
+inline constexpr size_t k_leaf_gemm_workspace_bytes = size_t{2} * 1024 * 1024 * 1024;
 
 struct host_range {
   int64_t start = 0;
@@ -479,6 +481,196 @@ __global__ void leaf_cross_knn_kernel(T const* dataset,
   }
 }
 
+static __global__ void gather_float_leaf_vectors_kernel(float const* dataset,
+                                                        int64_t dim,
+                                                        uint32_t const* sorted_ids,
+                                                        uint32_t const* leaf_starts,
+                                                        uint32_t const* leaf_ends,
+                                                        int64_t leaf_offset,
+                                                        int64_t leaf_count,
+                                                        float* leaf_vectors)
+{
+  int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+  int64_t total  = leaf_count * k_max_cluster * dim;
+  for (; linear < total; linear += stride) {
+    int64_t d          = linear % dim;
+    int64_t local_row  = (linear / dim) % k_max_cluster;
+    int64_t local_leaf = linear / (dim * k_max_cluster);
+    int64_t leaf       = leaf_offset + local_leaf;
+    int64_t leaf_n     = static_cast<int64_t>(leaf_ends[leaf] - leaf_starts[leaf]);
+    float value        = 0.0f;
+    if (local_row < leaf_n) {
+      uint32_t point = sorted_ids[leaf_starts[leaf] + local_row];
+      value          = dataset[static_cast<int64_t>(point) * dim + d];
+    }
+    leaf_vectors[linear] = value;
+  }
+}
+
+template <typename T>
+__global__ void gather_integer_leaf_vectors_kernel(T const* dataset,
+                                                   int64_t input_dim,
+                                                   int64_t output_dim,
+                                                   uint32_t const* sorted_ids,
+                                                   uint32_t const* leaf_starts,
+                                                   uint32_t const* leaf_ends,
+                                                   int64_t leaf_offset,
+                                                   int64_t leaf_count,
+                                                   int8_t* leaf_vectors)
+{
+  int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+  int64_t total  = leaf_count * k_max_cluster * output_dim;
+  for (; linear < total; linear += stride) {
+    int64_t d          = linear % output_dim;
+    int64_t local_row  = (linear / output_dim) % k_max_cluster;
+    int64_t local_leaf = linear / (output_dim * k_max_cluster);
+    int64_t leaf       = leaf_offset + local_leaf;
+    int8_t value       = 0;
+    int64_t leaf_n     = static_cast<int64_t>(leaf_ends[leaf] - leaf_starts[leaf]);
+    if (local_row < leaf_n && d < input_dim) {
+      uint32_t point = sorted_ids[leaf_starts[leaf] + local_row];
+      auto input     = dataset[static_cast<int64_t>(point) * input_dim + d];
+      if constexpr (std::is_same_v<T, uint8_t>) {
+        // Subtracting the same constant from every coordinate preserves pairwise L2 distance.
+        value = static_cast<int8_t>(static_cast<int>(input) - 128);
+      } else {
+        value = input;
+      }
+    }
+    leaf_vectors[linear] = value;
+  }
+}
+
+static __global__ void leaf_gram_i32_knn_kernel(int32_t const* gram,
+                                                uint32_t const* sorted_ids,
+                                                uint32_t const* origins,
+                                                uint32_t const* leaf_starts,
+                                                uint32_t const* leaf_ends,
+                                                int64_t leaf_offset,
+                                                int64_t leaf_count,
+                                                uint32_t* graph,
+                                                uint8_t* degrees)
+{
+  int64_t local_leaf = blockIdx.x;
+  if (local_leaf >= leaf_count) { return; }
+  int64_t leaf   = leaf_offset + local_leaf;
+  uint32_t start = leaf_starts[leaf];
+  int leaf_n     = static_cast<int>(leaf_ends[leaf] - start);
+  if (leaf_n <= 1 || leaf_n > k_max_cluster) { return; }
+
+  __shared__ uint32_t ids[k_max_cluster];
+  __shared__ uint32_t leaf_origins[k_max_cluster];
+  for (int i = threadIdx.x; i < leaf_n; i += blockDim.x) {
+    ids[i]          = sorted_ids[start + i];
+    leaf_origins[i] = origins[ids[i]];
+  }
+  __syncthreads();
+
+  int u = threadIdx.x;
+  if (u >= leaf_n) { return; }
+  int32_t top_d[k_degree];
+  uint8_t top_v[k_degree];
+#pragma unroll
+  for (int t = 0; t < k_degree; ++t) {
+    top_d[t] = std::numeric_limits<int32_t>::max();
+    top_v[t] = std::numeric_limits<uint8_t>::max();
+  }
+
+  int64_t gram_base = local_leaf * k_max_cluster * k_max_cluster;
+  int32_t norm_u    = gram[gram_base + u * k_max_cluster + u];
+  for (int v = 0; v < leaf_n; ++v) {
+    if (u == v || leaf_origins[u] == leaf_origins[v]) { continue; }
+    int32_t norm_v   = gram[gram_base + v * k_max_cluster + v];
+    int32_t dot      = gram[gram_base + v * k_max_cluster + u];
+    int32_t distance = norm_u + norm_v - 2 * dot;
+    int worst        = 0;
+#pragma unroll
+    for (int t = 1; t < k_degree; ++t) {
+      if (top_d[t] > top_d[worst]) { worst = t; }
+    }
+    if (distance < top_d[worst]) {
+      top_d[worst] = distance;
+      top_v[worst] = static_cast<uint8_t>(v);
+    }
+  }
+
+  int selected = 0;
+#pragma unroll
+  for (int t = 0; t < k_degree; ++t) {
+    if (top_v[t] != std::numeric_limits<uint8_t>::max()) {
+      graph[static_cast<int64_t>(ids[u]) * k_degree + selected] = ids[top_v[t]];
+      ++selected;
+    }
+  }
+  degrees[ids[u]] = static_cast<uint8_t>(selected);
+}
+
+static __global__ void leaf_gram_f32_knn_kernel(float const* gram,
+                                                uint32_t const* sorted_ids,
+                                                uint32_t const* origins,
+                                                uint32_t const* leaf_starts,
+                                                uint32_t const* leaf_ends,
+                                                int64_t leaf_offset,
+                                                int64_t leaf_count,
+                                                uint32_t* graph,
+                                                uint8_t* degrees)
+{
+  int64_t local_leaf = blockIdx.x;
+  if (local_leaf >= leaf_count) { return; }
+  int64_t leaf   = leaf_offset + local_leaf;
+  uint32_t start = leaf_starts[leaf];
+  int leaf_n     = static_cast<int>(leaf_ends[leaf] - start);
+  if (leaf_n <= 1 || leaf_n > k_max_cluster) { return; }
+
+  __shared__ uint32_t ids[k_max_cluster];
+  __shared__ uint32_t leaf_origins[k_max_cluster];
+  for (int i = threadIdx.x; i < leaf_n; i += blockDim.x) {
+    ids[i]          = sorted_ids[start + i];
+    leaf_origins[i] = origins[ids[i]];
+  }
+  __syncthreads();
+
+  int u = threadIdx.x;
+  if (u >= leaf_n) { return; }
+  float top_d[k_degree];
+  uint8_t top_v[k_degree];
+#pragma unroll
+  for (int t = 0; t < k_degree; ++t) {
+    top_d[t] = k_inf;
+    top_v[t] = std::numeric_limits<uint8_t>::max();
+  }
+
+  int64_t gram_base = local_leaf * k_max_cluster * k_max_cluster;
+  float norm_u      = gram[gram_base + u * k_max_cluster + u];
+  for (int v = 0; v < leaf_n; ++v) {
+    if (u == v || leaf_origins[u] == leaf_origins[v]) { continue; }
+    float norm_v   = gram[gram_base + v * k_max_cluster + v];
+    float dot      = gram[gram_base + v * k_max_cluster + u];
+    float distance = fmaxf(0.0f, fmaf(-2.0f, dot, norm_u + norm_v));
+    int worst      = 0;
+#pragma unroll
+    for (int t = 1; t < k_degree; ++t) {
+      if (top_d[t] > top_d[worst]) { worst = t; }
+    }
+    if (distance < top_d[worst]) {
+      top_d[worst] = distance;
+      top_v[worst] = static_cast<uint8_t>(v);
+    }
+  }
+
+  int selected = 0;
+#pragma unroll
+  for (int t = 0; t < k_degree; ++t) {
+    if (isfinite(top_d[t]) && top_v[t] != std::numeric_limits<uint8_t>::max()) {
+      graph[static_cast<int64_t>(ids[u]) * k_degree + selected] = ids[top_v[t]];
+      ++selected;
+    }
+  }
+  degrees[ids[u]] = static_cast<uint8_t>(selected);
+}
+
 static __global__ void pad_scaffold_kernel(uint32_t* graph,
                                            uint8_t* degrees,
                                            uint32_t const* fallback,
@@ -592,17 +784,172 @@ auto build(raft::resources const& res,
   rmm::device_uvector<uint32_t> ends(ends_host.size(), stream);
   raft::copy(starts.data(), starts_host.data(), starts.size(), stream);
   raft::copy(ends.data(), ends_host.data(), ends.size(), stream);
-  leaf_cross_knn_kernel<<<static_cast<int>(leaves.size()), k_cluster_size, 0, stream>>>(
-    dataset.data_handle(),
-    dataset.extent(1),
-    ids.data(),
-    origins.data(),
-    starts.data(),
-    ends.data(),
-    leaves.size(),
-    graph.data_handle(),
-    degrees.data());
-  RAFT_CUDA_TRY(cudaGetLastError());
+
+  // A full Gram matrix does twice the arithmetic of a triangular distance matrix, but batched
+  // cuBLAS is substantially faster than the direct leaf kernel. Process bounded leaf batches so
+  // the temporary gathered vectors and Gram matrices never exceed the workspace cap.
+  bool used_gemm = false;
+  if constexpr (std::is_same_v<T, float>) {
+    int64_t input_dimension = dataset.extent(1);
+    if (input_dimension <= std::numeric_limits<int>::max()) {
+      int dimension                   = static_cast<int>(input_dimension);
+      size_t vector_elements_per_leaf = static_cast<size_t>(k_max_cluster) * dimension;
+      size_t gram_elements_per_leaf   = static_cast<size_t>(k_max_cluster) * k_max_cluster;
+      size_t bytes_per_leaf = (vector_elements_per_leaf + gram_elements_per_leaf) * sizeof(float);
+      if (bytes_per_leaf <= k_leaf_gemm_workspace_bytes) {
+        size_t batch_capacity = std::max<size_t>(
+          1, std::min<size_t>(leaves.size(), k_leaf_gemm_workspace_bytes / bytes_per_leaf));
+        rmm::device_uvector<float> leaf_vectors(batch_capacity * vector_elements_per_leaf, stream);
+        rmm::device_uvector<float> gram(batch_capacity * gram_elements_per_leaf, stream);
+        float alpha             = 1.0f;
+        float beta              = 0.0f;
+        long long vector_stride = static_cast<long long>(vector_elements_per_leaf);
+        long long gram_stride   = static_cast<long long>(gram_elements_per_leaf);
+        auto cublas_handle      = raft::resource::get_cublas_handle(res);
+        RAFT_CUBLAS_TRY(cublasSetPointerMode(cublas_handle, CUBLAS_POINTER_MODE_HOST));
+        for (size_t leaf_offset = 0; leaf_offset < leaves.size(); leaf_offset += batch_capacity) {
+          size_t batch_size    = std::min(batch_capacity, leaves.size() - leaf_offset);
+          int64_t gather_items = static_cast<int64_t>(batch_size * vector_elements_per_leaf);
+          int gather_blocks =
+            static_cast<int>(std::min<int64_t>((gather_items + 255) / 256, 1048576));
+          gather_float_leaf_vectors_kernel<<<gather_blocks, 256, 0, stream>>>(
+            dataset.data_handle(),
+            dimension,
+            ids.data(),
+            starts.data(),
+            ends.data(),
+            static_cast<int64_t>(leaf_offset),
+            static_cast<int64_t>(batch_size),
+            leaf_vectors.data());
+          RAFT_CUDA_TRY(cudaGetLastError());
+          RAFT_CUBLAS_TRY(cublasGemmStridedBatchedEx(cublas_handle,
+                                                     CUBLAS_OP_T,
+                                                     CUBLAS_OP_N,
+                                                     k_max_cluster,
+                                                     k_max_cluster,
+                                                     dimension,
+                                                     &alpha,
+                                                     leaf_vectors.data(),
+                                                     CUDA_R_32F,
+                                                     dimension,
+                                                     vector_stride,
+                                                     leaf_vectors.data(),
+                                                     CUDA_R_32F,
+                                                     dimension,
+                                                     vector_stride,
+                                                     &beta,
+                                                     gram.data(),
+                                                     CUDA_R_32F,
+                                                     k_max_cluster,
+                                                     gram_stride,
+                                                     static_cast<int>(batch_size),
+                                                     CUBLAS_COMPUTE_32F,
+                                                     CUBLAS_GEMM_DEFAULT));
+          leaf_gram_f32_knn_kernel<<<static_cast<int>(batch_size), k_cluster_size, 0, stream>>>(
+            gram.data(),
+            ids.data(),
+            origins.data(),
+            starts.data(),
+            ends.data(),
+            static_cast<int64_t>(leaf_offset),
+            static_cast<int64_t>(batch_size),
+            graph.data_handle(),
+            degrees.data());
+          RAFT_CUDA_TRY(cudaGetLastError());
+        }
+        used_gemm = true;
+      }
+    }
+  } else if constexpr (std::is_same_v<T, uint8_t> || std::is_same_v<T, int8_t>) {
+    constexpr int64_t max_safe_dimension = std::numeric_limits<int32_t>::max() / (255 * 255);
+    int64_t input_dimension              = dataset.extent(1);
+    if (input_dimension <= max_safe_dimension) {
+      int64_t padded_dimension        = (input_dimension + 3) & ~int64_t{3};
+      size_t vector_elements_per_leaf = static_cast<size_t>(k_max_cluster) * padded_dimension;
+      size_t gram_elements_per_leaf   = static_cast<size_t>(k_max_cluster) * k_max_cluster;
+      size_t bytes_per_leaf =
+        vector_elements_per_leaf * sizeof(int8_t) + gram_elements_per_leaf * sizeof(int32_t);
+      if (bytes_per_leaf <= k_leaf_gemm_workspace_bytes) {
+        size_t batch_capacity = std::max<size_t>(
+          1, std::min<size_t>(leaves.size(), k_leaf_gemm_workspace_bytes / bytes_per_leaf));
+        rmm::device_uvector<int8_t> leaf_vectors(batch_capacity * vector_elements_per_leaf, stream);
+        rmm::device_uvector<int32_t> gram(batch_capacity * gram_elements_per_leaf, stream);
+        int32_t alpha           = 1;
+        int32_t beta            = 0;
+        int dimension           = static_cast<int>(padded_dimension);
+        long long vector_stride = static_cast<long long>(vector_elements_per_leaf);
+        long long gram_stride   = static_cast<long long>(gram_elements_per_leaf);
+        auto cublas_handle      = raft::resource::get_cublas_handle(res);
+        RAFT_CUBLAS_TRY(cublasSetPointerMode(cublas_handle, CUBLAS_POINTER_MODE_HOST));
+        for (size_t leaf_offset = 0; leaf_offset < leaves.size(); leaf_offset += batch_capacity) {
+          size_t batch_size    = std::min(batch_capacity, leaves.size() - leaf_offset);
+          int64_t gather_items = static_cast<int64_t>(batch_size * vector_elements_per_leaf);
+          int gather_blocks =
+            static_cast<int>(std::min<int64_t>((gather_items + 255) / 256, 1048576));
+          gather_integer_leaf_vectors_kernel<<<gather_blocks, 256, 0, stream>>>(
+            dataset.data_handle(),
+            input_dimension,
+            padded_dimension,
+            ids.data(),
+            starts.data(),
+            ends.data(),
+            static_cast<int64_t>(leaf_offset),
+            static_cast<int64_t>(batch_size),
+            leaf_vectors.data());
+          RAFT_CUDA_TRY(cudaGetLastError());
+          RAFT_CUBLAS_TRY(cublasGemmStridedBatchedEx(cublas_handle,
+                                                     CUBLAS_OP_T,
+                                                     CUBLAS_OP_N,
+                                                     k_max_cluster,
+                                                     k_max_cluster,
+                                                     dimension,
+                                                     &alpha,
+                                                     leaf_vectors.data(),
+                                                     CUDA_R_8I,
+                                                     dimension,
+                                                     vector_stride,
+                                                     leaf_vectors.data(),
+                                                     CUDA_R_8I,
+                                                     dimension,
+                                                     vector_stride,
+                                                     &beta,
+                                                     gram.data(),
+                                                     CUDA_R_32I,
+                                                     k_max_cluster,
+                                                     gram_stride,
+                                                     static_cast<int>(batch_size),
+                                                     CUBLAS_COMPUTE_32I,
+                                                     CUBLAS_GEMM_DEFAULT));
+          leaf_gram_i32_knn_kernel<<<static_cast<int>(batch_size), k_cluster_size, 0, stream>>>(
+            gram.data(),
+            ids.data(),
+            origins.data(),
+            starts.data(),
+            ends.data(),
+            static_cast<int64_t>(leaf_offset),
+            static_cast<int64_t>(batch_size),
+            graph.data_handle(),
+            degrees.data());
+          RAFT_CUDA_TRY(cudaGetLastError());
+        }
+        used_gemm = true;
+      }
+    }
+  }
+
+  if (!used_gemm) {
+    leaf_cross_knn_kernel<<<static_cast<int>(leaves.size()), k_cluster_size, 0, stream>>>(
+      dataset.data_handle(),
+      dataset.extent(1),
+      ids.data(),
+      origins.data(),
+      starts.data(),
+      ends.data(),
+      leaves.size(),
+      graph.data_handle(),
+      degrees.data());
+    RAFT_CUDA_TRY(cudaGetLastError());
+  }
 
   int blocks = static_cast<int>((rows + 255) / 256);
   pad_scaffold_kernel<<<blocks, 256, 0, stream>>>(

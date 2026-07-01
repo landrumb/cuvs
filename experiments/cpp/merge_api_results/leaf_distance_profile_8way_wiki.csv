@@ -1,0 +1,5 @@
+implementation,merge_wall_ms,operation,gpu_time_ms,calls
+direct-l2,479.487682,direct leaf L2,183.625308,1
+gemm-fp32,326.456782,gather leaf vectors,8.371567,1
+gemm-fp32,326.456782,batched FP32 GEMM,13.460842,1
+gemm-fp32,326.456782,Gram top-k selection,0.476547,1

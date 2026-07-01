@@ -6,7 +6,8 @@ merges. Unfiltered `L2Expanded` merges of at least two attached, uncompressed CA
 1. concatenate the input datasets on the device;
 2. preserve each input graph as a disconnected, offset-adjusted base graph;
 3. build one deterministic pivot tree (seed 1234) with leaf size 128;
-4. connect every point to its four nearest leaf points originating in another input graph;
+4. compute each leaf's cross-origin neighbors from a Gram matrix in bounded batches (FP32 GEMM
+   for float data and native int8/int32 GEMM for byte data);
 5. append those four scaffold neighbors to the base graph;
 6. distance-sort the dense graph in place;
 7. run the existing CAGRA graph optimizer to the requested `index_params.graph_degree`; and
@@ -14,10 +15,12 @@ merges. Unfiltered `L2Expanded` merges of at least two attached, uncompressed CA
 
 The scaffold uses stable binary scatter rather than a global radix sort at every pivot level.
 Per-chunk counts preserve the checkpoint's active-first, stable ordering while transferring only
-compact count and offset arrays. Float32 and uint8 distance loops use aligned four-element loads,
-and the pivot kernel computes both pivot distances while loading each point once. Uint8 data stays
-native byte storage throughout partition construction, scaffold construction, optimization, and
-search.
+compact count and offset arrays. Pivot distance loops use aligned four-element loads, and the pivot
+kernel computes both pivot distances while loading each point once. Leaf vectors are gathered into
+at most 2 GiB of temporary batches. Float32 uses standard-precision FP32 Gram matrices. Uint8 is
+centered by 128 into int8 (which preserves L2 distance) and multiplied with exact int32 accumulation;
+signed int8 uses the same path without centering. There is no float conversion of the byte dataset.
+Float16 and integer dimensions unsafe for int32 accumulation retain the direct-L2 leaf kernel.
 
 The optimizer writes directly to its final device matrix. The returned index takes ownership of
 that matrix, avoiding optimizer host writeback and the subsequent host-to-device graph copy. The
@@ -36,12 +39,13 @@ unchanged.
   uint8 scaffold entries versus the checkpoint global-sort path.
 - Runtime smoke tests at the current leaf-128 default for all four datatypes verify graph bounds,
   cross-origin edges, owned dataset and graph lifetimes, graph-only output, and successful CAGRA
-  search.
+  search. Deterministic 4,096-point checks give identical ordered scaffold hashes for direct L2 and
+  the production FP32, uint8, and signed-int8 Gram paths.
 - The leaf-64 checkpoint passed the existing float32 and uint8 merge suites. The leaf-64 optimized
   objects additionally pass seven focused upstream cases covering L2 device input, L2 host input,
   and the InnerProduct rebuild fallback.
-- All nine leaf-64 dataset/fan-in benchmarks and all 30 leaf-size sweep runs completed with the
-  complete query and ground-truth sets.
+- All nine leaf-64 dataset/fan-in benchmarks, all 30 leaf-size sweep runs, and the new 8-way
+  distance/origin trials completed with the complete query and ground-truth sets.
 
 ## Benchmark boundary
 
@@ -57,6 +61,9 @@ NVIDIA H100 PCIe 80 GB. Raw retained results are in
 [merge_api_results/results.csv](merge_api_results/results.csv); all optimization trials, including
 rejected variants, are in
 [merge_api_results/optimization_exploration.csv](merge_api_results/optimization_exploration.csv).
+The leaf-distance and origin-diversity studies are in
+[merge_api_results/leaf_distance_8way.csv](merge_api_results/leaf_distance_8way.csv) and
+[merge_api_results/origin_diversity_8way.csv](merge_api_results/origin_diversity_8way.csv).
 
 ## Leaf-64 optimization results versus scratch construction
 
@@ -177,7 +184,130 @@ The tradeoff is consistent across datasets:
 Based on this sweep, the production default is now 128. Leaf 256 remains a recall-oriented
 alternative; sizes above 256 are dominated.
 
-## Nsight Systems profile
+## Leaf-distance matrix study at 8-way fan-in
+
+The leaf-128 kernel previously evaluated every directed candidate independently, so each
+cross-origin unordered pair was loaded and evaluated twice. Four alternatives were run at 8-way
+fan-in on every dataset:
+
+- **Direct L2:** the committed control, one thread per point.
+- **Symmetric L2:** compute each unordered pair once into the 8,128-entry triangular shared-memory
+  matrix, then scan that matrix from both endpoints.
+- **Norm + dot:** use `||x-y||² = xᵀx + yᵀy - 2xᵀy` in the same symmetric matrix. The YFCC path
+  uses native uint8 DP4A dot products rather than converting the dataset to float.
+- **Batched GEMM:** gather leaf vectors, form full 128×128 Gram matrices with cuBLAS, then run a
+  small top-k selection kernel. Float uses standard FP32 compute. Uint8 is centered into int8 and
+  accumulated exactly into int32.
+
+The table below uses the exact production-object run and its contemporaneous direct-L2 control.
+Each optimized cell gives its actual value first and its change from direct L2 in parentheses.
+Partition graph construction remains oracular and excluded from build time.
+
+| dataset | direct-L2 merge | production GEMM merge | direct Recall@12 | GEMM Recall@12 | direct QPS | GEMM QPS |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Wiki-1M | 0.475 s | 0.320 s (-32.51%) | 0.974633 | 0.974675 (+0.000042) | 67,044 | 67,094 (+0.07%) |
+| OpenAI-2M | 2.371 s | 1.483 s (-37.46%) | 0.913892 | 0.913754 (-0.000138) | 32,758 | 32,749 (-0.03%) |
+| YFCC-10M (uint8) | 1.838 s | 1.697 s (-7.67%) | 0.950550 | 0.950523 (-0.000027) | 350,667 | 351,425 (+0.22%) |
+
+The rejected custom-kernel results explain why symmetry alone is insufficient. Actual values are
+shown first; parentheses are changes from the direct-L2 row for that dataset.
+
+| dataset | leaf-distance method | merge build time | Recall@12 |
+| --- | --- | ---: | ---: |
+| Wiki-1M | direct L2 | 0.475 s (baseline) | 0.974633 (baseline) |
+| Wiki-1M | symmetric L2 | 0.488 s (+2.89%) | 0.974525 (-0.000108) |
+| Wiki-1M | symmetric norm + dot | 0.475 s (+0.05%) | 0.974258 (-0.000375) |
+| Wiki-1M | production FP32 GEMM | 0.320 s (-32.51%) | 0.974675 (+0.000042) |
+| OpenAI-2M | direct L2 | 2.371 s (baseline) | 0.913892 (baseline) |
+| OpenAI-2M | symmetric L2 | 2.617 s (+10.40%) | 0.913442 (-0.000450) |
+| OpenAI-2M | symmetric norm + dot | 2.476 s (+4.44%) | 0.913925 (+0.000033) |
+| OpenAI-2M | production FP32 GEMM | 1.483 s (-37.46%) | 0.913754 (-0.000138) |
+| YFCC-10M (uint8) | direct L2 | 1.838 s (baseline) | 0.950550 (baseline) |
+| YFCC-10M (uint8) | symmetric L2 | 1.971 s (+7.24%) | 0.950825 (+0.000275) |
+| YFCC-10M (uint8) | symmetric norm + DP4A dot | 1.986 s (+8.03%) | 0.950912 (+0.000362) |
+| YFCC-10M (uint8) | production int8/int32 GEMM | 1.697 s (-7.67%) | 0.950523 (-0.000027) |
+
+![Eight-way leaf-distance comparison](merge_api_results/plots/k4_leaf_distance_8way.png)
+
+Following the report's plotting convention, the figure uses scratch CAGRA construction as the
+build-time, QPS, and recall baseline; the tables above use direct L2 to isolate the leaf-kernel
+change.
+
+The symmetric kernels halve distance evaluations, but their 32 KiB triangular matrix lowers
+occupancy and adds a matrix write plus a second scan. They therefore range from neutral to 10.40%
+slower. GEMM computes both matrix triangles—more arithmetic than the symmetric kernel—but executes
+that arithmetic far more efficiently. A standard-FP32 deterministic check matched the direct-L2
+ordered scaffold hash. Fast TF32 was another 2.2–2.7% faster on the two float datasets, but changed
+the deterministic graph hash, so it was not retained.
+
+The first prototype allocated every padded leaf at once. Leaves are not packed to exactly 128
+points: the Wiki profile produced 16,411 leaves, so that prototype needed 7.53 GB of temporary leaf
+vectors plus Gram matrices on Wiki alone and scaled still higher on the larger datasets. Production
+instead processes leaf batches with a 2 GiB aggregate cap. The cap had no measured penalty: the
+2 GiB trials were 0.323 s, 1.483 s, and 1.677 s, versus 0.321 s, 1.512 s, and 1.687 s for the
+unbounded trials. A 512 MiB alternative was only 1.0% slower than 2 GiB on OpenAI and 0.7% slower
+on YFCC, but 2 GiB is retained for the larger GEMM batches.
+
+### Leaf-stage profile
+
+Nsight Systems 2026.3.1 captured only `merge()` on Wiki-1M at 8-way fan-in. The ordinary control
+and production runs are reported above; profile instrumentation changed their wall times to
+479.488 ms and 326.457 ms. GPU leaf work changes as follows:
+
+| implementation | gather | distance/Gram matrix | top-k selection | total leaf GPU time |
+| --- | ---: | ---: | ---: | ---: |
+| direct L2 | — | 183.625 ms | included | 183.625 ms |
+| FP32 GEMM | 8.372 ms | 13.461 ms | 0.477 ms | 22.309 ms (8.23x faster) |
+
+![Wiki eight-way leaf-stage profile](merge_api_results/plots/k4_leaf_distance_profile.png)
+
+The 161.3 ms leaf-stage reduction accounts for the 153.0 ms profiled wall-time reduction; the
+small difference is allocation/library overhead and run variation. Raw curated profile values are
+in
+[merge_api_results/leaf_distance_profile_8way_wiki.csv](merge_api_results/leaf_distance_profile_8way_wiki.csv).
+All method, precision, workspace, and repeated GEMM trials are retained in
+[merge_api_results/leaf_distance_8way.csv](merge_api_results/leaf_distance_8way.csv), and the plots
+are reproducible with [plot_k4_leaf_distance.py](plot_k4_leaf_distance.py).
+
+## Origin-diverse scaffold neighbors
+
+The strict 8-way policy first selects the nearest representative from each of the four closest
+foreign origins. If fewer than four foreign origins occur in the leaf, it selects one from every
+available origin and fills the remaining slots by unconstrained distance. A one-pass implementation
+tracks the nearest representative per retained origin plus the four unconstrained nearest points,
+so it performs the same number of L2 evaluations as the control. A symmetric-matrix cross-check
+produced the same per-row neighbor sets. Two natural softer variants require only two or three
+origins before filling by distance.
+
+Actual constrained values are shown first; parentheses give the change from the unconstrained run
+for that dataset. These are one full-query run per policy, so small changes include variation from
+rebuilding the oracular partition indexes.
+
+| dataset | origin policy | merge build time | Recall@12 |
+| --- | --- | ---: | ---: |
+| Wiki-1M | unconstrained | 0.475 s (baseline) | 0.974633 (baseline) |
+| Wiki-1M | at least 2 origins | 0.475 s (+0.12%) | 0.974467 (-0.000166) |
+| Wiki-1M | at least 3 origins | 0.479 s (+0.85%) | 0.974825 (+0.000192) |
+| Wiki-1M | strict 4 origins | 0.474 s (-0.09%) | 0.974333 (-0.000300) |
+| OpenAI-2M | unconstrained | 2.371 s (baseline) | 0.913892 (baseline) |
+| OpenAI-2M | at least 2 origins | 2.368 s (-0.11%) | 0.913000 (-0.000892) |
+| OpenAI-2M | at least 3 origins | 2.377 s (+0.27%) | 0.913646 (-0.000246) |
+| OpenAI-2M | strict 4 origins | 2.373 s (+0.10%) | 0.912338 (-0.001554) |
+| YFCC-10M (uint8) | unconstrained | 1.838 s (baseline) | 0.950550 (baseline) |
+| YFCC-10M (uint8) | at least 2 origins | 1.800 s (-2.09%) | 0.950986 (+0.000436) |
+| YFCC-10M (uint8) | at least 3 origins | 1.809 s (-1.60%) | 0.951049 (+0.000499) |
+| YFCC-10M (uint8) | strict 4 origins | 1.815 s (-1.26%) | 0.950823 (+0.000273) |
+
+![Eight-way origin-diversity comparison](merge_api_results/plots/k4_origin_diversity_8way.png)
+
+The policy has no consistent build-time effect beyond run variation. Quality is mixed: all three
+constraints improve the single YFCC run, Wiki is effectively flat, and strict diversity costs
+0.001554 Recall@12 on OpenAI. The three-origin alternative reduces that OpenAI loss but does not
+show a cross-dataset advantage over the unconstrained rule. No origin constraint is enabled in
+production. Raw rows are in
+[merge_api_results/origin_diversity_8way.csv](merge_api_results/origin_diversity_8way.csv).
+
+## Earlier leaf-64 optimization profile
 
 The final leaf-64 two-way Wiki capture measures 368.887 ms profiled versus 855.152 ms at the
 leaf-64 checkpoint. The ordinary leaf-64 benchmark improves from 811.624 ms to 362.392 ms

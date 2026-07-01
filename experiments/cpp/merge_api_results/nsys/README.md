@@ -106,3 +106,33 @@ Additional optimized artifacts:
 - `wiki1m_2way_k4_optimized.nsys-rep`: final interactive Nsight Systems report.
 - `wiki1m_2way_k4_optimized_*_sum.csv`: final kernel, memory, API, and NVTX summaries.
 - `wiki1m_2way_k4_optimized_profile_result.csv`: captured benchmark row.
+
+## Leaf-128 distance-matrix follow-up (8-way)
+
+Nsight Systems 2026.3.1 also captured the direct-L2 and standard-FP32 GEMM leaf implementations
+on Wiki-1M at 8-way fan-in. The same CUDA-profiler boundary excludes all eight oracular partition
+builds and includes only the public `merge()` call.
+
+| item | direct L2 | FP32 GEMM |
+| --- | ---: | ---: |
+| profiled merge wall time | 479.488 ms | 326.457 ms (-31.91%) |
+| direct leaf L2 | 183.625 ms | — |
+| gather leaf vectors | — | 8.372 ms |
+| batched Gram GEMM | — | 13.461 ms |
+| Gram top-k selection | — | 0.477 ms |
+| total leaf stage | 183.625 ms | 22.309 ms (8.23x faster) |
+| distance sort | 96.710 ms | 99.976 ms |
+| optimizer fused prune | 93.842 ms | 93.567 ms |
+| pivot assignment | 60.141 ms | 60.216 ms |
+
+The non-leaf kernels are stable. Replacing the 183.6 ms direct leaf kernel with 22.3 ms of gather,
+GEMM, and selection saves 161.3 ms of GPU work and 153.0 ms of profiled wall time. The remaining
+difference is cuBLAS/allocation overhead and run variation.
+
+Artifacts:
+
+- `wiki1m_8way_leaf128_direct.nsys-rep`: direct-L2 control.
+- `wiki1m_8way_leaf128_gemm_fp32.nsys-rep`: standard-FP32 Gram path.
+- `../leaf_distance_profile_8way_wiki.csv`: curated values used by the report plot.
+
+Both captures used `--parts 8 --profile-merge` with the same command shape documented above.
