@@ -19,12 +19,12 @@
 #include <thrust/device_ptr.h>
 #include <thrust/execution_policy.h>
 #include <thrust/sequence.h>
-#include <thrust/sort.h>
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <type_traits>
 #include <vector>
 
 namespace cuvs::neighbors::cagra::detail::merge_scaffold {
@@ -34,6 +34,7 @@ inline constexpr int k_cluster_size          = 64;
 inline constexpr int k_max_cluster           = 64;
 inline constexpr int k_pivot_assign_chunk    = 256;
 inline constexpr int k_leaf_assign_chunk     = 1024;
+inline constexpr int k_pivot_block_size      = 128;
 inline constexpr int k_max_pivot_tree_levels = 64;
 inline constexpr uint64_t k_seed             = 1234;
 inline constexpr float k_inf                 = 3.4028234663852886e38f;
@@ -44,12 +45,17 @@ struct host_range {
 };
 
 struct pivot_chunk {
-  int64_t start     = 0;
-  int64_t end       = 0;
-  uint32_t key_base = 0;
-  uint32_t pivot_a  = 0;
-  uint32_t pivot_b  = 0;
-  uint8_t active    = 0;
+  uint32_t start       = 0;
+  uint32_t end         = 0;
+  uint32_t pivot_a     = 0;
+  uint32_t pivot_b     = 0;
+  uint32_t range_index = 0;
+  uint8_t active       = 0;
+};
+
+struct scatter_offset {
+  uint32_t left  = 0;
+  uint32_t right = 0;
 };
 
 __host__ __device__ inline uint64_t splitmix64(uint64_t x)
@@ -58,32 +64,6 @@ __host__ __device__ inline uint64_t splitmix64(uint64_t x)
   x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ull;
   x = (x ^ (x >> 27)) * 0x94d049bb133111ebull;
   return x ^ (x >> 31);
-}
-
-template <typename T>
-std::vector<T> copy_to_host(raft::resources const& res, rmm::device_uvector<T> const& input)
-{
-  std::vector<T> output(input.size());
-  raft::copy(output.data(), input.data(), input.size(), raft::resource::get_cuda_stream(res));
-  raft::resource::sync_stream(res);
-  return output;
-}
-
-inline std::vector<host_range> scan_key_ranges(std::vector<uint32_t> const& keys)
-{
-  std::vector<host_range> ranges;
-  if (keys.empty()) { return ranges; }
-  int64_t start = 0;
-  uint32_t key  = keys.front();
-  for (int64_t i = 1; i < static_cast<int64_t>(keys.size()); ++i) {
-    if (keys[static_cast<size_t>(i)] != key) {
-      ranges.push_back({start, i});
-      start = i;
-      key   = keys[static_cast<size_t>(i)];
-    }
-  }
-  ranges.push_back({start, static_cast<int64_t>(keys.size())});
-  return ranges;
 }
 
 inline std::vector<host_range> split_large_ranges(std::vector<host_range> const& ranges)
@@ -99,7 +79,6 @@ inline std::vector<host_range> split_large_ranges(std::vector<host_range> const&
 }
 
 inline int make_pivot_chunks(std::vector<host_range> const& ranges,
-                             std::vector<uint32_t> const& ids,
                              int level,
                              std::vector<pivot_chunk>& chunks)
 {
@@ -109,40 +88,109 @@ inline int make_pivot_chunks(std::vector<host_range> const& ranges,
   }
 
   chunks.clear();
-  int active_index = 0;
-  int leaf_index   = 0;
   for (size_t r = 0; r < ranges.size(); ++r) {
     auto const& range = ranges[r];
     int64_t n         = range.end - range.start;
     bool active       = n > k_cluster_size;
-    uint32_t key_base = 0;
     uint32_t pivot_a  = 0;
     uint32_t pivot_b  = 0;
     int chunk_size    = active ? k_pivot_assign_chunk : k_leaf_assign_chunk;
 
     if (active) {
-      key_base      = static_cast<uint32_t>(2 * active_index++);
       uint64_t h    = splitmix64(k_seed ^ (uint64_t(level) * 0x94d049bb133111ebull) ^
                               (uint64_t(r) * 0x9e3779b97f4a7c15ull));
       int64_t off_a = static_cast<int64_t>(h % static_cast<uint64_t>(n));
       int64_t off_b = static_cast<int64_t>(splitmix64(h) % static_cast<uint64_t>(n));
       if (off_a == off_b) { off_b = (off_b + 1) % n; }
-      pivot_a = ids[static_cast<size_t>(range.start + off_a)];
-      pivot_b = ids[static_cast<size_t>(range.start + off_b)];
-    } else {
-      key_base = static_cast<uint32_t>(2 * active_count + leaf_index++);
+      pivot_a = static_cast<uint32_t>(range.start + off_a);
+      pivot_b = static_cast<uint32_t>(range.start + off_b);
     }
 
-    for (int64_t start = range.start; start < range.end; start += chunk_size) {
-      chunks.push_back({start,
-                        std::min<int64_t>(range.end, start + chunk_size),
-                        key_base,
-                        pivot_a,
-                        pivot_b,
-                        static_cast<uint8_t>(active ? 1 : 0)});
+    for (int64_t chunk_start = range.start; chunk_start < range.end; chunk_start += chunk_size) {
+      chunks.push_back(
+        {static_cast<uint32_t>(chunk_start),
+         static_cast<uint32_t>(std::min<int64_t>(range.end, chunk_start + chunk_size)),
+         pivot_a,
+         pivot_b,
+         static_cast<uint32_t>(r),
+         static_cast<uint8_t>(active ? 1 : 0)});
     }
   }
   return active_count;
+}
+
+inline auto prepare_scatter(std::vector<host_range> const& ranges,
+                            std::vector<uint32_t> const& chunk_left_counts,
+                            std::vector<pivot_chunk> const& chunks,
+                            std::vector<scatter_offset>& scatter_offsets) -> std::vector<host_range>
+{
+  RAFT_EXPECTS(chunk_left_counts.size() == chunks.size(), "Pivot chunk count mismatch");
+
+  // Match the old stable sort exactly: split active ranges first, in range order, then carry
+  // completed leaves after them. Prefixes within each chunk preserve the input ID order.
+  scatter_offsets.resize(chunks.size());
+  std::vector<uint32_t> range_left_counts(ranges.size(), 0);
+  int64_t active_rows = 0;
+  for (size_t r = 0; r < ranges.size(); ++r) {
+    if (ranges[r].end - ranges[r].start > k_cluster_size) {
+      active_rows += ranges[r].end - ranges[r].start;
+    }
+  }
+  for (size_t i = 0; i < chunks.size(); ++i) {
+    if (chunks[i].active) { range_left_counts[chunks[i].range_index] += chunk_left_counts[i]; }
+  }
+
+  std::vector<int64_t> left_bases(ranges.size(), 0);
+  std::vector<int64_t> right_bases(ranges.size(), 0);
+  std::vector<int64_t> leaf_bases(ranges.size(), 0);
+  std::vector<host_range> active_ranges;
+  std::vector<host_range> leaf_ranges;
+  active_ranges.reserve(ranges.size() * 2);
+  leaf_ranges.reserve(ranges.size());
+
+  int64_t active_cursor = 0;
+  int64_t leaf_cursor   = active_rows;
+  for (size_t r = 0; r < ranges.size(); ++r) {
+    auto const& range = ranges[r];
+    int64_t n         = range.end - range.start;
+    if (n > k_cluster_size) {
+      int64_t left   = range_left_counts[r];
+      int64_t right  = n - left;
+      left_bases[r]  = active_cursor;
+      right_bases[r] = active_cursor + left;
+      if (left > 0) { active_ranges.push_back({active_cursor, active_cursor + left}); }
+      if (right > 0) {
+        active_ranges.push_back({active_cursor + left, active_cursor + left + right});
+      }
+      active_cursor += n;
+    } else {
+      leaf_bases[r] = leaf_cursor;
+      leaf_ranges.push_back({leaf_cursor, leaf_cursor + n});
+      leaf_cursor += n;
+    }
+  }
+
+  std::vector<uint32_t> left_prefix(ranges.size(), 0);
+  std::vector<uint32_t> right_prefix(ranges.size(), 0);
+  for (size_t i = 0; i < chunks.size(); ++i) {
+    auto const& chunk = chunks[i];
+    auto& output      = scatter_offsets[i];
+    size_t r          = chunk.range_index;
+    if (chunk.active) {
+      uint32_t left  = chunk_left_counts[i];
+      uint32_t right = static_cast<uint32_t>(chunk.end - chunk.start) - left;
+      output.left    = static_cast<uint32_t>(left_bases[r] + left_prefix[r]);
+      output.right   = static_cast<uint32_t>(right_bases[r] + right_prefix[r]);
+      left_prefix[r] += left;
+      right_prefix[r] += right;
+    } else {
+      output.left  = static_cast<uint32_t>(leaf_bases[r] + chunk.start - ranges[r].start);
+      output.right = output.left;
+    }
+  }
+
+  active_ranges.insert(active_ranges.end(), leaf_ranges.begin(), leaf_ranges.end());
+  return active_ranges;
 }
 
 template <typename T>
@@ -151,6 +199,45 @@ __device__ float l2_distance(T const* dataset, int64_t dim, uint32_t a, uint32_t
   float acc   = 0.0f;
   T const* pa = dataset + static_cast<int64_t>(a) * dim;
   T const* pb = dataset + static_cast<int64_t>(b) * dim;
+  if constexpr (std::is_same_v<T, float>) {
+    if (dim % 4 == 0 && reinterpret_cast<uintptr_t>(pa) % alignof(float4) == 0 &&
+        reinterpret_cast<uintptr_t>(pb) % alignof(float4) == 0) {
+      auto pa4 = reinterpret_cast<float4 const*>(pa);
+      auto pb4 = reinterpret_cast<float4 const*>(pb);
+      for (int64_t d = 0; d < dim / 4; ++d) {
+        float4 va  = pa4[d];
+        float4 vb  = pb4[d];
+        float diff = va.x - vb.x;
+        acc += diff * diff;
+        diff = va.y - vb.y;
+        acc += diff * diff;
+        diff = va.z - vb.z;
+        acc += diff * diff;
+        diff = va.w - vb.w;
+        acc += diff * diff;
+      }
+      return acc;
+    }
+  } else if constexpr (std::is_same_v<T, uint8_t>) {
+    if (dim % 4 == 0 && reinterpret_cast<uintptr_t>(pa) % alignof(uchar4) == 0 &&
+        reinterpret_cast<uintptr_t>(pb) % alignof(uchar4) == 0) {
+      auto pa4 = reinterpret_cast<uchar4 const*>(pa);
+      auto pb4 = reinterpret_cast<uchar4 const*>(pb);
+      for (int64_t d = 0; d < dim / 4; ++d) {
+        uchar4 va  = pa4[d];
+        uchar4 vb  = pb4[d];
+        float diff = static_cast<float>(va.x) - static_cast<float>(vb.x);
+        acc += diff * diff;
+        diff = static_cast<float>(va.y) - static_cast<float>(vb.y);
+        acc += diff * diff;
+        diff = static_cast<float>(va.z) - static_cast<float>(vb.z);
+        acc += diff * diff;
+        diff = static_cast<float>(va.w) - static_cast<float>(vb.w);
+        acc += diff * diff;
+      }
+      return acc;
+    }
+  }
   for (int64_t d = 0; d < dim; ++d) {
     float diff = static_cast<float>(pa[d]) - static_cast<float>(pb[d]);
     acc += diff * diff;
@@ -159,25 +246,162 @@ __device__ float l2_distance(T const* dataset, int64_t dim, uint32_t a, uint32_t
 }
 
 template <typename T>
-__global__ void pivot_assign_keys_kernel(T const* dataset,
-                                         int64_t dim,
-                                         uint32_t const* ids,
-                                         pivot_chunk const* chunks,
-                                         int64_t chunk_count,
-                                         uint32_t* keys)
+__device__ void l2_distance_pair(T const* dataset,
+                                 int64_t dim,
+                                 uint32_t point,
+                                 uint32_t pivot_a,
+                                 uint32_t pivot_b,
+                                 float& distance_a,
+                                 float& distance_b)
+{
+  distance_a        = 0.0f;
+  distance_b        = 0.0f;
+  T const* point_p  = dataset + static_cast<int64_t>(point) * dim;
+  T const* pivot_ap = dataset + static_cast<int64_t>(pivot_a) * dim;
+  T const* pivot_bp = dataset + static_cast<int64_t>(pivot_b) * dim;
+  if constexpr (std::is_same_v<T, float>) {
+    if (dim % 4 == 0 && reinterpret_cast<uintptr_t>(point_p) % alignof(float4) == 0 &&
+        reinterpret_cast<uintptr_t>(pivot_ap) % alignof(float4) == 0 &&
+        reinterpret_cast<uintptr_t>(pivot_bp) % alignof(float4) == 0) {
+      auto point4   = reinterpret_cast<float4 const*>(point_p);
+      auto pivot_a4 = reinterpret_cast<float4 const*>(pivot_ap);
+      auto pivot_b4 = reinterpret_cast<float4 const*>(pivot_bp);
+      for (int64_t d = 0; d < dim / 4; ++d) {
+        float4 value = point4[d];
+        float4 va    = pivot_a4[d];
+        float4 vb    = pivot_b4[d];
+        float diff_a = value.x - va.x;
+        float diff_b = value.x - vb.x;
+        distance_a += diff_a * diff_a;
+        distance_b += diff_b * diff_b;
+        diff_a = value.y - va.y;
+        diff_b = value.y - vb.y;
+        distance_a += diff_a * diff_a;
+        distance_b += diff_b * diff_b;
+        diff_a = value.z - va.z;
+        diff_b = value.z - vb.z;
+        distance_a += diff_a * diff_a;
+        distance_b += diff_b * diff_b;
+        diff_a = value.w - va.w;
+        diff_b = value.w - vb.w;
+        distance_a += diff_a * diff_a;
+        distance_b += diff_b * diff_b;
+      }
+      return;
+    }
+  } else if constexpr (std::is_same_v<T, uint8_t>) {
+    if (dim % 4 == 0 && reinterpret_cast<uintptr_t>(point_p) % alignof(uchar4) == 0 &&
+        reinterpret_cast<uintptr_t>(pivot_ap) % alignof(uchar4) == 0 &&
+        reinterpret_cast<uintptr_t>(pivot_bp) % alignof(uchar4) == 0) {
+      auto point4   = reinterpret_cast<uchar4 const*>(point_p);
+      auto pivot_a4 = reinterpret_cast<uchar4 const*>(pivot_ap);
+      auto pivot_b4 = reinterpret_cast<uchar4 const*>(pivot_bp);
+      for (int64_t d = 0; d < dim / 4; ++d) {
+        uchar4 value = point4[d];
+        uchar4 va    = pivot_a4[d];
+        uchar4 vb    = pivot_b4[d];
+        float diff_a = static_cast<float>(value.x) - static_cast<float>(va.x);
+        float diff_b = static_cast<float>(value.x) - static_cast<float>(vb.x);
+        distance_a += diff_a * diff_a;
+        distance_b += diff_b * diff_b;
+        diff_a = static_cast<float>(value.y) - static_cast<float>(va.y);
+        diff_b = static_cast<float>(value.y) - static_cast<float>(vb.y);
+        distance_a += diff_a * diff_a;
+        distance_b += diff_b * diff_b;
+        diff_a = static_cast<float>(value.z) - static_cast<float>(va.z);
+        diff_b = static_cast<float>(value.z) - static_cast<float>(vb.z);
+        distance_a += diff_a * diff_a;
+        distance_b += diff_b * diff_b;
+        diff_a = static_cast<float>(value.w) - static_cast<float>(va.w);
+        diff_b = static_cast<float>(value.w) - static_cast<float>(vb.w);
+        distance_a += diff_a * diff_a;
+        distance_b += diff_b * diff_b;
+      }
+      return;
+    }
+  }
+  for (int64_t d = 0; d < dim; ++d) {
+    float value  = static_cast<float>(point_p[d]);
+    float diff_a = value - static_cast<float>(pivot_ap[d]);
+    float diff_b = value - static_cast<float>(pivot_bp[d]);
+    distance_a += diff_a * diff_a;
+    distance_b += diff_b * diff_b;
+  }
+}
+
+template <typename T>
+__global__ void pivot_assign_sides_kernel(T const* dataset,
+                                          int64_t dim,
+                                          uint32_t const* ids,
+                                          pivot_chunk const* chunks,
+                                          int64_t chunk_count,
+                                          uint8_t* sides,
+                                          uint32_t* chunk_left_counts)
 {
   int64_t chunk_idx = blockIdx.x;
   if (chunk_idx >= chunk_count) { return; }
-  pivot_chunk chunk = chunks[chunk_idx];
-  for (int64_t pos = chunk.start + threadIdx.x; pos < chunk.end; pos += blockDim.x) {
-    if (!chunk.active) {
-      keys[pos] = chunk.key_base;
-      continue;
+  pivot_chunk chunk   = chunks[chunk_idx];
+  uint32_t local_left = 0;
+  if (chunk.active) {
+    uint32_t pivot_a = ids[chunk.pivot_a];
+    uint32_t pivot_b = ids[chunk.pivot_b];
+    for (int64_t pos = chunk.start + threadIdx.x; pos < chunk.end; pos += blockDim.x) {
+      uint32_t id = ids[pos];
+      float da;
+      float db;
+      l2_distance_pair(dataset, dim, id, pivot_a, pivot_b, da, db);
+      uint8_t side = static_cast<uint8_t>(db < da ? 1 : 0);
+      sides[pos]   = side;
+      local_left += side == 0;
     }
-    uint32_t id = ids[pos];
-    float da    = l2_distance(dataset, dim, id, chunk.pivot_a);
-    float db    = l2_distance(dataset, dim, id, chunk.pivot_b);
-    keys[pos]   = chunk.key_base + (db < da ? 1u : 0u);
+  }
+
+  __shared__ uint32_t reduction[k_pivot_block_size];
+  reduction[threadIdx.x] = local_left;
+  __syncthreads();
+  for (int offset = blockDim.x / 2; offset > 0; offset /= 2) {
+    if (threadIdx.x < offset) { reduction[threadIdx.x] += reduction[threadIdx.x + offset]; }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) { chunk_left_counts[chunk_idx] = reduction[0]; }
+}
+
+static __global__ void stable_scatter_kernel(uint32_t const* input_ids,
+                                             uint8_t const* sides,
+                                             pivot_chunk const* chunks,
+                                             scatter_offset const* scatter_offsets,
+                                             int64_t chunk_count,
+                                             uint32_t* output_ids)
+{
+  int64_t chunk_idx = blockIdx.x;
+  if (chunk_idx >= chunk_count) { return; }
+  pivot_chunk chunk     = chunks[chunk_idx];
+  scatter_offset output = scatter_offsets[chunk_idx];
+  if (!chunk.active) {
+    for (int64_t pos = chunk.start + threadIdx.x; pos < chunk.end; pos += blockDim.x) {
+      output_ids[output.left + pos - chunk.start] = input_ids[pos];
+    }
+    return;
+  }
+
+  int64_t pos    = chunk.start + threadIdx.x;
+  bool valid     = pos < chunk.end;
+  bool goes_left = valid && sides[pos] == 0;
+  __shared__ uint32_t left_prefix[256];
+  left_prefix[threadIdx.x] = goes_left ? 1u : 0u;
+  __syncthreads();
+  for (int offset = 1; offset < blockDim.x; offset *= 2) {
+    uint32_t add = threadIdx.x >= offset ? left_prefix[threadIdx.x - offset] : 0;
+    __syncthreads();
+    if (threadIdx.x >= offset) { left_prefix[threadIdx.x] += add; }
+    __syncthreads();
+  }
+
+  if (valid) {
+    uint32_t left_before    = left_prefix[threadIdx.x] - (goes_left ? 1u : 0u);
+    uint32_t right_before   = threadIdx.x - left_before;
+    uint32_t destination    = goes_left ? output.left + left_before : output.right + right_before;
+    output_ids[destination] = input_ids[pos];
   }
 }
 
@@ -303,43 +527,58 @@ auto build(raft::resources const& res,
     RAFT_CUDA_TRY(cudaGetLastError());
   }
 
-  rmm::device_uvector<uint32_t> keys(rows, stream);
   rmm::device_uvector<uint32_t> ids(rows, stream);
+  rmm::device_uvector<uint32_t> next_ids(rows, stream);
+  rmm::device_uvector<uint8_t> sides(rows, stream);
   thrust::sequence(thrust::cuda::par.on(stream),
                    thrust::device_pointer_cast(ids.data()),
                    thrust::device_pointer_cast(ids.data() + ids.size()),
                    uint32_t{0});
   raft::resource::sync_stream(res);
 
-  std::vector<uint32_t> ids_host(static_cast<size_t>(rows));
-  for (int64_t i = 0; i < rows; ++i) {
-    ids_host[static_cast<size_t>(i)] = static_cast<uint32_t>(i);
-  }
-  std::vector<uint32_t> keys_host;
   std::vector<host_range> ranges{{0, rows}};
   std::vector<pivot_chunk> chunks;
+  std::vector<uint32_t> chunk_left_counts;
+  std::vector<scatter_offset> scatter_offsets;
+  rmm::device_uvector<pivot_chunk> device_chunks(0, stream);
+  rmm::device_uvector<uint32_t> device_left_counts(0, stream);
+  rmm::device_uvector<scatter_offset> device_scatter_offsets(0, stream);
 
   for (int level = 0; level < k_max_pivot_tree_levels; ++level) {
-    int active_count = make_pivot_chunks(ranges, ids_host, level, chunks);
+    int active_count = make_pivot_chunks(ranges, level, chunks);
     if (active_count == 0) { break; }
 
-    rmm::device_uvector<pivot_chunk> device_chunks(chunks.size(), stream);
+    device_chunks.resize(chunks.size(), stream);
+    device_left_counts.resize(chunks.size(), stream);
     raft::copy(device_chunks.data(), chunks.data(), chunks.size(), stream);
-    pivot_assign_keys_kernel<<<static_cast<int>(chunks.size()), 128, 0, stream>>>(
+    pivot_assign_sides_kernel<<<static_cast<int>(chunks.size()), k_pivot_block_size, 0, stream>>>(
       dataset.data_handle(),
       dataset.extent(1),
       ids.data(),
       device_chunks.data(),
       static_cast<int64_t>(chunks.size()),
-      keys.data());
+      sides.data(),
+      device_left_counts.data());
     RAFT_CUDA_TRY(cudaGetLastError());
-    thrust::sort_by_key(thrust::cuda::par.on(stream),
-                        thrust::device_pointer_cast(keys.data()),
-                        thrust::device_pointer_cast(keys.data() + keys.size()),
-                        thrust::device_pointer_cast(ids.data()));
-    keys_host = copy_to_host(res, keys);
-    ids_host  = copy_to_host(res, ids);
-    ranges    = scan_key_ranges(keys_host);
+
+    chunk_left_counts.resize(chunks.size());
+    raft::copy(
+      chunk_left_counts.data(), device_left_counts.data(), device_left_counts.size(), stream);
+    raft::resource::sync_stream(res);
+    ranges = prepare_scatter(ranges, chunk_left_counts, chunks, scatter_offsets);
+
+    device_scatter_offsets.resize(scatter_offsets.size(), stream);
+    raft::copy(
+      device_scatter_offsets.data(), scatter_offsets.data(), scatter_offsets.size(), stream);
+    stable_scatter_kernel<<<static_cast<int>(chunks.size()), 256, 0, stream>>>(
+      ids.data(),
+      sides.data(),
+      device_chunks.data(),
+      device_scatter_offsets.data(),
+      static_cast<int64_t>(chunks.size()),
+      next_ids.data());
+    RAFT_CUDA_TRY(cudaGetLastError());
+    std::swap(ids, next_ids);
   }
 
   auto leaves = split_large_ranges(ranges);

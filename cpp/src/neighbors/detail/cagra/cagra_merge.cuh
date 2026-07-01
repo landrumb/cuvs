@@ -238,33 +238,25 @@ index<T, IdxT> merge_with_k4_scaffold(raft::resources const& handle,
 
   RAFT_EXPECTS(static_cast<int64_t>(params.graph_degree) <= merged_graph.extent(1),
                "Requested output graph degree exceeds input graph degree plus the k=4 scaffold");
-  cagra::detail::graph::sort_knn_graph(
+  cagra::detail::graph::sort_knn_graph_device_inplace(
     handle, params.metric, raft::make_const_mdspan(updated_dataset.view()), merged_graph.view());
 
-  auto optimized_graph = raft::make_host_matrix<uint32_t, int64_t>(int64_t(new_dataset_size),
-                                                                   int64_t(params.graph_degree));
+  auto optimized_graph = raft::make_device_matrix<uint32_t, int64_t>(
+    handle, int64_t(new_dataset_size), int64_t(params.graph_degree));
   cagra::detail::graph::optimize(
     handle, merged_graph.view(), optimized_graph.view(), params.guarantee_connectivity);
 
-  if (!params.attach_dataset_on_build) {
-    index<T, IdxT> merged_index(handle, params.metric);
-    merged_index.update_graph(handle, raft::make_const_mdspan(optimized_graph.view()));
-    return merged_index;
-  }
+  index<T, IdxT> merged_index(handle, params.metric);
+  merged_index.update_graph(handle, std::move(optimized_graph));
+  if (!params.attach_dataset_on_build) { return merged_index; }
 
-  index<T, IdxT> merged_index(handle,
-                              params.metric,
-                              raft::make_const_mdspan(updated_dataset.view()),
-                              raft::make_const_mdspan(optimized_graph.view()));
-  if (!merged_index.data().is_owning()) {
-    using matrix_t           = decltype(updated_dataset);
-    using layout_t           = typename matrix_t::layout_type;
-    using container_policy_t = typename matrix_t::container_policy_type;
-    using owning_t           = owning_dataset<T, int64_t, layout_t, container_policy_t>;
-    auto out_layout          = raft::make_strided_layout(updated_dataset.view().extents(),
-                                                cuda::std::array<int64_t, 2>{int64_t(dim), 1});
-    merged_index.update_dataset(handle, owning_t{std::move(updated_dataset), out_layout});
-  }
+  using matrix_t           = decltype(updated_dataset);
+  using layout_t           = typename matrix_t::layout_type;
+  using container_policy_t = typename matrix_t::container_policy_type;
+  using owning_t           = owning_dataset<T, int64_t, layout_t, container_policy_t>;
+  auto out_layout          = raft::make_strided_layout(updated_dataset.view().extents(),
+                                              cuda::std::array<int64_t, 2>{int64_t(dim), 1});
+  merged_index.update_dataset(handle, owning_t{std::move(updated_dataset), out_layout});
   return merged_index;
 }
 
@@ -274,8 +266,7 @@ index<T, IdxT> merge(raft::resources const& handle,
                      std::vector<cuvs::neighbors::cagra::index<T, IdxT>*>& indices,
                      const cuvs::neighbors::filtering::base_filter& row_filter)
 {
-  bool l2_metric = params.metric == cuvs::distance::DistanceType::L2Expanded ||
-                   params.metric == cuvs::distance::DistanceType::L2SqrtExpanded;
+  bool l2_metric              = params.metric == cuvs::distance::DistanceType::L2Expanded;
   bool graph_degree_supported = false;
   if (!indices.empty()) {
     std::size_t max_input_degree = 0;

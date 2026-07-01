@@ -39,8 +39,9 @@ small: copying the two input graphs plus appending the scaffold takes about 6.21
 | memset | 0.342 ms | 32.950 MB | 301 |
 
 The repeated pivot levels are the clearest optimization target: 50 pivot-assignment kernels and
-50 `sort_by_key` ranges accompany substantial device/host traffic. Keeping pivot partitioning and
-range discovery on the GPU should remove much of that transfer and synchronization cost.
+50 `sort_by_key` ranges accompany substantial device/host traffic. Avoiding full key and ID-array
+transfers and the per-level global sort should remove much of that transfer and synchronization
+cost.
 
 ## Host/API and NVTX observations
 
@@ -77,3 +78,31 @@ nsys profile \
   --parts 2 \
   --profile-merge
 ```
+
+## Optimized comparison
+
+The final optimized capture uses the same merge-only boundary and took 368.887 ms profiled
+(362.392 ms without profiling), versus 855.152 ms profiled (811.624 ms without profiling) at the
+checkpoint.
+
+| item | checkpoint | optimized |
+| --- | ---: | ---: |
+| pivot assignment kernels | 195.174 ms | 63.479 ms |
+| leaf cross-origin k-NN | 56.405 ms | 42.194 ms |
+| distance sort | 103.708 ms | 104.138 ms |
+| CAGRA optimize NVTX range | 312.464 ms | 111.255 ms |
+| `cudaFree` API time | 199.656 ms | 3.294 ms |
+| device-to-host data | 912.000 MB | 4.051 MB |
+| host-to-device data | 800.668 MB | 32.668 MB |
+| device-to-device data | 6,688.000 MB | 3,107.157 MB |
+
+The checkpoint's 50 `sort_by_key` frees account for 194.041 ms of its `cudaFree` API time.
+That duration is primarily synchronization with preceding pivot/sort kernels, rather than allocator
+bookkeeping. Stable scatter removes those per-level radix-sort allocations and full key/ID copies.
+Direct device optimizer output removes the large graph host writeback and copy back into the index.
+
+Additional optimized artifacts:
+
+- `wiki1m_2way_k4_optimized.nsys-rep`: final interactive Nsight Systems report.
+- `wiki1m_2way_k4_optimized_*_sum.csv`: final kernel, memory, API, and NVTX summaries.
+- `wiki1m_2way_k4_optimized_profile_result.csv`: captured benchmark row.

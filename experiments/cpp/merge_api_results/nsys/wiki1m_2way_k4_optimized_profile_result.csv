@@ -1,0 +1,2 @@
+dataset,parts,implementation,dtype,rows,queries,graph_degree,intermediate_graph_degree,itopk,oracle_partition_build_ms_excluded,merge_api_e2e_ms,search_ms,recall,qps
+Wiki-1M,2,optimized-k4-profile,float32,1000000,10000,64,128,160,8033.308907,368.887461,146.672402,0.990908,68179.152067
