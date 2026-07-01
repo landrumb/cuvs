@@ -5,7 +5,7 @@ merges. Unfiltered `L2Expanded` merges of at least two attached, uncompressed CA
 
 1. concatenate the input datasets on the device;
 2. preserve each input graph as a disconnected, offset-adjusted base graph;
-3. build one deterministic pivot tree (seed 1234) with leaf size 64;
+3. build one deterministic pivot tree (seed 1234) with leaf size 128;
 4. connect every point to its four nearest leaf points originating in another input graph;
 5. append those four scaffold neighbors to the base graph;
 6. distance-sort the dense graph in place;
@@ -32,14 +32,16 @@ unchanged.
 ## Validation
 
 - Release instantiations compile with warnings-as-errors for float32, float16, int8, and uint8.
-- A fixed-input comparison found zero differences across 131,072 float32 and 131,072 uint8
-  scaffold entries versus the checkpoint global-sort path.
-- Runtime smoke tests for all four datatypes verify graph bounds, cross-origin edges, owned dataset
-  and graph lifetimes, graph-only output, and successful CAGRA search.
-- The checkpoint passed the existing float32 and uint8 merge suites. The final optimized objects
-  additionally pass seven focused upstream cases covering L2 device input, L2 host input, and the
-  InnerProduct rebuild fallback.
-- All nine full dataset/fan-in benchmarks completed with the complete query and ground-truth sets.
+- A leaf-64 fixed-input comparison found zero differences across 131,072 float32 and 131,072
+  uint8 scaffold entries versus the checkpoint global-sort path.
+- Runtime smoke tests at the current leaf-128 default for all four datatypes verify graph bounds,
+  cross-origin edges, owned dataset and graph lifetimes, graph-only output, and successful CAGRA
+  search.
+- The leaf-64 checkpoint passed the existing float32 and uint8 merge suites. The leaf-64 optimized
+  objects additionally pass seven focused upstream cases covering L2 device input, L2 host input,
+  and the InnerProduct rebuild fallback.
+- All nine leaf-64 dataset/fan-in benchmarks and all 30 leaf-size sweep runs completed with the
+  complete query and ground-truth sets.
 
 ## Benchmark boundary
 
@@ -56,11 +58,12 @@ NVIDIA H100 PCIe 80 GB. Raw retained results are in
 rejected variants, are in
 [merge_api_results/optimization_exploration.csv](merge_api_results/optimization_exploration.csv).
 
-## Final results versus scratch construction
+## Leaf-64 optimization results versus scratch construction
 
-Parentheses give the optimized k=4 change relative to scratch CAGRA at the same dataset and fan-in.
+Parentheses give the optimized leaf-64 k=4 change relative to scratch CAGRA at the same dataset
+and fan-in.
 
-| dataset | fan-in | scratch merge | optimized k=4 merge | scratch Recall@12 | optimized Recall@12 | scratch QPS | optimized QPS |
+| dataset | fan-in | scratch merge | optimized leaf-64 merge | scratch Recall@12 | leaf-64 Recall@12 | scratch QPS | leaf-64 QPS |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | Wiki-1M | 2 | 3.633 s | 0.362 s (10.0x faster) | 0.992233 | 0.990825 (-0.001408) | 71,238 | 68,298 (-4.13%) |
 | Wiki-1M | 4 | 3.673 s | 0.389 s (9.44x faster) | 0.992125 | 0.984325 (-0.007800) | 71,137 | 67,664 (-4.88%) |
@@ -72,12 +75,12 @@ Parentheses give the optimized k=4 change relative to scratch CAGRA at the same 
 | YFCC-10M (uint8) | 4 | 23.616 s | 1.841 s (12.8x faster) | 0.988560 | 0.973110 (-0.015450) | 350,951 | 351,690 (+0.21%) |
 | YFCC-10M (uint8) | 8 | 23.681 s | 1.847 s (12.8x faster) | 0.988664 | 0.944563 (-0.044101) | 350,825 | 346,738 (-1.16%) |
 
-## Improvement over the checkpoint
+## Leaf-64 improvement over the checkpoint
 
-The optimized row gives its actual value; the percentage reduction and recall/QPS changes are
-relative to commit `db4260f6`.
+The optimized leaf-64 row gives its actual value; the percentage reduction and recall/QPS
+changes are relative to commit `db4260f6`.
 
-| dataset | fan-in | checkpoint merge | optimized merge | checkpoint Recall@12 | optimized Recall@12 | checkpoint QPS | optimized QPS |
+| dataset | fan-in | checkpoint merge | optimized leaf-64 merge | checkpoint Recall@12 | leaf-64 Recall@12 | checkpoint QPS | leaf-64 QPS |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | Wiki-1M | 2 | 0.812 s | 0.362 s (-55.35%) | 0.990458 | 0.990825 (+0.000367) | 68,823 | 68,298 (-0.76%) |
 | Wiki-1M | 4 | 0.867 s | 0.389 s (-55.13%) | 0.985033 | 0.984325 (-0.000708) | 67,910 | 67,664 (-0.36%) |
@@ -95,7 +98,7 @@ indexes between runs.
 
 ## Optimization exploration
 
-Two-way merge time at each retained stage:
+Two-way merge time at each retained stage; all stages use leaf size 64:
 
 | stage | Wiki-1M | OpenAI-2M | YFCC-10M |
 | --- | ---: | ---: | ---: |
@@ -119,10 +122,66 @@ Rejected experiments:
 - 64- and 256-thread pivot launches did not beat 128 threads across all datasets.
 - Active-only pivot descriptors were within noise and slightly slower on YFCC.
 
+## Larger-leaf sweep at 8-way fan-in
+
+Eight-way fan-in has the largest recall loss, so the leaf-size experiment prioritizes that case.
+The sweep covers leaf sizes 64, 128, 256, 512, and 1024 on all three datasets. Each point is the
+arithmetic mean of two independent runs using the complete query and ground-truth sets (10,000
+Wiki queries, 20,000 OpenAI queries, and 100,000 YFCC queries). The timing boundary is the same
+merge-only `merge_api_e2e_ms` boundary described above; construction of the eight input partition
+graphs remains oracular and excluded.
+
+Parentheses give the change from the leaf-64 mean for the same dataset. Actual build time and
+Recall@12 are shown first.
+
+| dataset | leaf size | merge build time | Recall@12 |
+| --- | ---: | ---: | ---: |
+| Wiki-1M | 64 | 0.400 s (baseline) | 0.969054 (baseline) |
+| Wiki-1M | 128 | 0.477 s (+19.09%) | 0.974100 (+0.005046) |
+| Wiki-1M | 256 | 0.652 s (+62.97%) | 0.976913 (+0.007859) |
+| Wiki-1M | 512 | 1.021 s (+155.24%) | 0.974617 (+0.005563) |
+| Wiki-1M | 1024 | 1.741 s (+335.07%) | 0.963480 (-0.005574) |
+| OpenAI-2M | 64 | 1.917 s (baseline) | 0.904121 (baseline) |
+| OpenAI-2M | 128 | 2.375 s (+23.92%) | 0.913361 (+0.009240) |
+| OpenAI-2M | 256 | 3.346 s (+74.53%) | 0.920098 (+0.015977) |
+| OpenAI-2M | 512 | 5.330 s (+178.06%) | 0.920044 (+0.015923) |
+| OpenAI-2M | 1024 | 9.379 s (+389.27%) | 0.906021 (+0.001900) |
+| YFCC-10M (uint8) | 64 | 1.851 s (baseline) | 0.944352 (baseline) |
+| YFCC-10M (uint8) | 128 | 1.835 s (-0.88%) | 0.950997 (+0.006644) |
+| YFCC-10M (uint8) | 256 | 1.890 s (+2.09%) | 0.955341 (+0.010989) |
+| YFCC-10M (uint8) | 512 | 2.203 s (+18.98%) | 0.954311 (+0.009959) |
+| YFCC-10M (uint8) | 1024 | 2.748 s (+48.44%) | 0.942174 (-0.002178) |
+
+![Eight-way leaf-size build-time and recall tradeoff](merge_api_results/plots/k4_leaf_size_8way.png)
+
+The dashed horizontal lines are the leaf-64 baselines, the dotted vertical line marks leaf 256,
+and error bars span the two runs. Raw measurements are in
+[merge_api_results/leaf_size_8way.csv](merge_api_results/leaf_size_8way.csv); the figure is
+reproducible with [plot_k4_leaf_size.py](plot_k4_leaf_size.py).
+
+The tradeoff is consistent across datasets:
+
+- Leaf 128 is the balanced setting. Recall improves by 0.005046 on Wiki, 0.009240 on OpenAI, and
+  0.006644 on YFCC. The float32 merge cost rises by 19.09–23.92%, while native-uint8 YFCC is
+  0.88% faster than leaf 64.
+- Leaf 256 gives the highest mean recall on every dataset: +0.007859 on Wiki, +0.015977 on OpenAI,
+  and +0.010989 on YFCC. Its merge-time cost is +62.97%, +74.53%, and only +2.09% respectively.
+- Leaf 512 adds substantial work without improving on leaf 256. Leaf 1024 is worse still: it costs
+  4.35x on Wiki and 4.89x on OpenAI, and recall falls below leaf 64 on Wiki and YFCC.
+- The likely cost mechanism is that doubling the leaf removes roughly one pivot level but doubles
+  the per-point leaf candidate comparisons. This favors low-dimensional native uint8 YFCC more
+  than the 768/1536-dimensional float datasets. The post-256 recall reversal suggests that forcing
+  some farther cross-origin bridges at smaller leaves helps navigation after CAGRA optimization;
+  this interpretation is an inference from the measured curve.
+
+Based on this sweep, the production default is now 128. Leaf 256 remains a recall-oriented
+alternative; sizes above 256 are dominated.
+
 ## Nsight Systems profile
 
-The final two-way Wiki capture measures 368.887 ms profiled versus 855.152 ms at the checkpoint.
-The ordinary benchmark improves from 811.624 ms to 362.392 ms (2.24x).
+The final leaf-64 two-way Wiki capture measures 368.887 ms profiled versus 855.152 ms at the
+leaf-64 checkpoint. The ordinary leaf-64 benchmark improves from 811.624 ms to 362.392 ms
+(2.24x).
 
 | item | checkpoint | optimized |
 | --- | ---: | ---: |

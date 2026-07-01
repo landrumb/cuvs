@@ -30,8 +30,8 @@
 namespace cuvs::neighbors::cagra::detail::merge_scaffold {
 
 inline constexpr int k_degree                = 4;
-inline constexpr int k_cluster_size          = 64;
-inline constexpr int k_max_cluster           = 64;
+inline constexpr int k_cluster_size          = 128;
+inline constexpr int k_max_cluster           = 128;
 inline constexpr int k_pivot_assign_chunk    = 256;
 inline constexpr int k_leaf_assign_chunk     = 1024;
 inline constexpr int k_pivot_block_size      = 128;
@@ -592,15 +592,16 @@ auto build(raft::resources const& res,
   rmm::device_uvector<uint32_t> ends(ends_host.size(), stream);
   raft::copy(starts.data(), starts_host.data(), starts.size(), stream);
   raft::copy(ends.data(), ends_host.data(), ends.size(), stream);
-  leaf_cross_knn_kernel<<<static_cast<int>(leaves.size()), 64, 0, stream>>>(dataset.data_handle(),
-                                                                            dataset.extent(1),
-                                                                            ids.data(),
-                                                                            origins.data(),
-                                                                            starts.data(),
-                                                                            ends.data(),
-                                                                            leaves.size(),
-                                                                            graph.data_handle(),
-                                                                            degrees.data());
+  leaf_cross_knn_kernel<<<static_cast<int>(leaves.size()), k_cluster_size, 0, stream>>>(
+    dataset.data_handle(),
+    dataset.extent(1),
+    ids.data(),
+    origins.data(),
+    starts.data(),
+    ends.data(),
+    leaves.size(),
+    graph.data_handle(),
+    degrees.data());
   RAFT_CUDA_TRY(cudaGetLastError());
 
   int blocks = static_cast<int>((rows + 255) / 256);
