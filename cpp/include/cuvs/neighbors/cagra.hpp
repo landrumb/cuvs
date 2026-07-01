@@ -2448,6 +2448,11 @@ void serialize_to_hnswlib(
  * @note: This API only supports physical merge (`merge_strategy = MERGE_STRATEGY_PHYSICAL`), and
  * attempting a logical merge here will throw an error.
  *
+ * @note: Unfiltered L2 merges of two or more attached, uncompressed indices reuse the input graphs
+ * by appending a degree-4 cross-input scaffold, distance-sorting the combined graph, and optimizing
+ * it to the requested output graph degree. Unsupported configurations retain the rebuild
+ * implementation.
+ *
  * Usage example:
  * @code{.cpp}
  *   using namespace cuvs::neighbors;

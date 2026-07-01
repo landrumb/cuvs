@@ -1,0 +1,10 @@
+Time (%),Total Time (ns),Instances,Avg (ns),Med (ns),Min (ns),Max (ns),StdDev (ns),Style,Range
+37.3,312464175,1,312464175.0,312464175.0,312464175,312464175,0.0,PushPop,"cuvs:cagra::graph::optimize(1000000, 68, 64)"
+24.8,207852712,50,4157054.2,2791196.5,403563,8874413,3503859.8,PushPop,CCCL:thrust::sort_by_key
+18.0,150516134,1,150516134.0,150516134.0,150516134,150516134,0.0,PushPop,cuvs:cagra::graph::optimize/prune
+13.7,114634081,1,114634081.0,114634081.0,114634081,114634081,0.0,PushPop,cuvs:cagra::graph::optimize/reverse
+5.6,46659877,1,46659877.0,46659877.0,46659877,46659877,0.0,PushPop,cuvs:cagra::graph::optimize/combine
+0.6,4766673,50,95333.5,89840.0,87801,199281,17024.4,PushPop,CCCL:cub::DeviceRadixSort
+0.0,123241,1,123241.0,123241.0,123241,123241,0.0,PushPop,CCCL:thrust::sequence
+0.0,121161,1,121161.0,121161.0,121161,121161,0.0,PushPop,CCCL:thrust::tabulate
+0.0,107881,1,107881.0,107881.0,107881,107881,0.0,PushPop,CCCL:cub::DeviceTransform::TransformIf

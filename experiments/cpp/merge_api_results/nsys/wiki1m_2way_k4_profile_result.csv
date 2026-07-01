@@ -1,0 +1,2 @@
+dataset,parts,implementation,dtype,rows,queries,graph_degree,intermediate_graph_degree,itopk,oracle_partition_build_ms_excluded,merge_api_e2e_ms,search_ms,recall,qps
+Wiki-1M,2,k4-scaffold-nsys-2026,float32,1000000,10000,64,128,160,7924.493726,855.152477,145.177262,0.990508,68881.310077

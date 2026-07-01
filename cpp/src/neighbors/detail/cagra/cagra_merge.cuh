@@ -4,6 +4,9 @@
  */
 #pragma once
 
+#include "cagra_merge_scaffold.cuh"
+#include "graph_core.cuh"
+
 #include <cuvs/neighbors/cagra.hpp>
 
 #include <raft/core/device_mdarray.hpp>
@@ -30,10 +33,10 @@
 namespace cuvs::neighbors::cagra::detail {
 
 template <class T, class IdxT>
-index<T, IdxT> merge(raft::resources const& handle,
-                     const cagra::index_params& params,
-                     std::vector<cuvs::neighbors::cagra::index<T, IdxT>*>& indices,
-                     const cuvs::neighbors::filtering::base_filter& row_filter)
+index<T, IdxT> merge_rebuild(raft::resources const& handle,
+                             const cagra::index_params& params,
+                             std::vector<cuvs::neighbors::cagra::index<T, IdxT>*>& indices,
+                             const cuvs::neighbors::filtering::base_filter& row_filter)
 {
   using cagra_index_t = cuvs::neighbors::cagra::index<T, IdxT>;
   using ds_idx_type   = typename cagra_index_t::dataset_index_type;
@@ -172,6 +175,130 @@ index<T, IdxT> merge(raft::resources const& handle,
       merged_index.update_dataset(handle, owning_t{std::move(updated_dataset), out_layout});
     }
     return merged_index;
+  }
+}
+
+template <class T, class IdxT>
+index<T, IdxT> merge_with_k4_scaffold(raft::resources const& handle,
+                                      const cagra::index_params& params,
+                                      std::vector<cuvs::neighbors::cagra::index<T, IdxT>*>& indices)
+{
+  using cagra_index_t = cuvs::neighbors::cagra::index<T, IdxT>;
+  using ds_idx_type   = typename cagra_index_t::dataset_index_type;
+
+  std::size_t dim              = 0;
+  std::size_t new_dataset_size = 0;
+  std::vector<int64_t> offsets;
+  offsets.reserve(indices.size() + 1);
+  offsets.push_back(0);
+
+  for (cagra_index_t* index : indices) {
+    RAFT_EXPECTS(index != nullptr,
+                 "Null pointer detected in 'indices'. Ensure all elements are valid before usage.");
+    auto const* strided_dset = dynamic_cast<const strided_dataset<T, ds_idx_type>*>(&index->data());
+    if (strided_dset == nullptr) {
+      if (dynamic_cast<const cuvs::neighbors::empty_dataset<int64_t>*>(&index->data()) != nullptr) {
+        RAFT_FAIL(
+          "cagra::merge only supports an index to which the dataset is attached. Please check if "
+          "the index was built with index_param.attach_dataset_on_build = true, or if a dataset "
+          "was attached after the build.");
+      }
+      RAFT_FAIL("cagra::merge only supports an uncompressed dataset index");
+    }
+    if (dim == 0) {
+      dim = index->dim();
+    } else {
+      RAFT_EXPECTS(dim == index->dim(), "Dimension of datasets in indices must be equal.");
+    }
+    new_dataset_size += index->size();
+    offsets.push_back(static_cast<int64_t>(new_dataset_size));
+  }
+
+  auto updated_dataset =
+    raft::make_device_matrix<T, int64_t>(handle, int64_t(new_dataset_size), int64_t(dim));
+  int64_t offset = 0;
+  for (cagra_index_t* index : indices) {
+    auto const* strided_dset = dynamic_cast<const strided_dataset<T, ds_idx_type>*>(&index->data());
+    auto source              = strided_dset->view();
+    raft::copy_matrix(updated_dataset.data_handle() + offset * dim,
+                      dim,
+                      source.data_handle(),
+                      static_cast<size_t>(strided_dset->stride()),
+                      dim,
+                      static_cast<size_t>(source.extent(0)),
+                      raft::resource::get_cuda_stream(handle));
+    offset += source.extent(0);
+  }
+  raft::resource::sync_stream(handle);
+
+  auto scaffold =
+    merge_scaffold::build<T>(handle, raft::make_const_mdspan(updated_dataset.view()), offsets);
+  auto merged_graph = merge_scaffold::append_to_input_graphs<T, IdxT>(
+    handle, indices, offsets, raft::make_const_mdspan(scaffold.view()));
+
+  RAFT_EXPECTS(static_cast<int64_t>(params.graph_degree) <= merged_graph.extent(1),
+               "Requested output graph degree exceeds input graph degree plus the k=4 scaffold");
+  cagra::detail::graph::sort_knn_graph(
+    handle, params.metric, raft::make_const_mdspan(updated_dataset.view()), merged_graph.view());
+
+  auto optimized_graph = raft::make_host_matrix<uint32_t, int64_t>(int64_t(new_dataset_size),
+                                                                   int64_t(params.graph_degree));
+  cagra::detail::graph::optimize(
+    handle, merged_graph.view(), optimized_graph.view(), params.guarantee_connectivity);
+
+  if (!params.attach_dataset_on_build) {
+    index<T, IdxT> merged_index(handle, params.metric);
+    merged_index.update_graph(handle, raft::make_const_mdspan(optimized_graph.view()));
+    return merged_index;
+  }
+
+  index<T, IdxT> merged_index(handle,
+                              params.metric,
+                              raft::make_const_mdspan(updated_dataset.view()),
+                              raft::make_const_mdspan(optimized_graph.view()));
+  if (!merged_index.data().is_owning()) {
+    using matrix_t           = decltype(updated_dataset);
+    using layout_t           = typename matrix_t::layout_type;
+    using container_policy_t = typename matrix_t::container_policy_type;
+    using owning_t           = owning_dataset<T, int64_t, layout_t, container_policy_t>;
+    auto out_layout          = raft::make_strided_layout(updated_dataset.view().extents(),
+                                                cuda::std::array<int64_t, 2>{int64_t(dim), 1});
+    merged_index.update_dataset(handle, owning_t{std::move(updated_dataset), out_layout});
+  }
+  return merged_index;
+}
+
+template <class T, class IdxT>
+index<T, IdxT> merge(raft::resources const& handle,
+                     const cagra::index_params& params,
+                     std::vector<cuvs::neighbors::cagra::index<T, IdxT>*>& indices,
+                     const cuvs::neighbors::filtering::base_filter& row_filter)
+{
+  bool l2_metric = params.metric == cuvs::distance::DistanceType::L2Expanded ||
+                   params.metric == cuvs::distance::DistanceType::L2SqrtExpanded;
+  bool graph_degree_supported = false;
+  if (!indices.empty()) {
+    std::size_t max_input_degree = 0;
+    for (auto const* index : indices) {
+      if (index != nullptr) {
+        max_input_degree = std::max<std::size_t>(max_input_degree, index->graph_degree());
+      }
+    }
+    graph_degree_supported =
+      params.graph_degree > 0 && params.graph_degree <= max_input_degree + merge_scaffold::k_degree;
+  }
+
+  bool use_scaffold =
+    row_filter.get_filter_type() == cuvs::neighbors::filtering::FilterType::None &&
+    indices.size() >= 2 && l2_metric && !params.compression.has_value() && graph_degree_supported;
+  if (!use_scaffold) { return merge_rebuild(handle, params, indices, row_filter); }
+
+  try {
+    return merge_with_k4_scaffold(handle, params, indices);
+  } catch (std::bad_alloc const&) {
+    RAFT_LOG_WARN(
+      "cagra::merge k=4 scaffold ran out of device memory; falling back to rebuild merge");
+    return merge_rebuild(handle, params, indices, row_filter);
   }
 }
 
