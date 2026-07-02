@@ -5,7 +5,7 @@ merges. Unfiltered `L2Expanded` merges of at least two attached, uncompressed CA
 
 1. concatenate the input datasets on the device;
 2. preserve each input graph as a disconnected, offset-adjusted base graph;
-3. build one deterministic pivot tree (seed 1234) with leaf size 128;
+3. build one deterministic pivot tree (seed 1234) with leaf size 256;
 4. compute each leaf's cross-origin neighbors from a Gram matrix in bounded batches (FP32 GEMM
    for float data and native int8/int32 GEMM for byte data);
 5. append those four scaffold neighbors to the base graph;
@@ -37,15 +37,16 @@ unchanged.
 - Release instantiations compile with warnings-as-errors for float32, float16, int8, and uint8.
 - A leaf-64 fixed-input comparison found zero differences across 131,072 float32 and 131,072
   uint8 scaffold entries versus the checkpoint global-sort path.
-- Runtime smoke tests at the current leaf-128 default for all four datatypes verify graph bounds,
+- Runtime smoke tests at the current leaf-256 default for all four datatypes verify graph bounds,
   cross-origin edges, owned dataset and graph lifetimes, graph-only output, and successful CAGRA
   search. Deterministic 4,096-point checks give identical ordered scaffold hashes for direct L2 and
   the production FP32, uint8, and signed-int8 Gram paths.
 - The leaf-64 checkpoint passed the existing float32 and uint8 merge suites. The leaf-64 optimized
   objects additionally pass seven focused upstream cases covering L2 device input, L2 host input,
   and the InnerProduct rebuild fallback.
-- All nine leaf-64 dataset/fan-in benchmarks, all 30 leaf-size sweep runs, and the new 8-way
-  distance/origin trials completed with the complete query and ground-truth sets.
+- All nine leaf-64 dataset/fan-in benchmarks, all 30 legacy leaf-size sweep runs, the 12 new
+  production leaf-64/256 runs, and the 8-way distance/origin trials completed with the complete
+  query and ground-truth sets.
 
 ## Benchmark boundary
 
@@ -64,6 +65,8 @@ rejected variants, are in
 The leaf-distance and origin-diversity studies are in
 [merge_api_results/leaf_distance_8way.csv](merge_api_results/leaf_distance_8way.csv) and
 [merge_api_results/origin_diversity_8way.csv](merge_api_results/origin_diversity_8way.csv).
+Production GEMM fan-in reruns are in
+[merge_api_results/production_gemm_fanin.csv](merge_api_results/production_gemm_fanin.csv).
 
 ## Leaf-64 optimization results versus scratch construction
 
@@ -161,34 +164,67 @@ Recall@12 are shown first.
 
 ![Eight-way leaf-size build-time and recall tradeoff](merge_api_results/plots/k4_leaf_size_8way.png)
 
-The dashed horizontal lines are the leaf-64 baselines, the dotted vertical line marks leaf 256,
-and error bars span the two runs. Raw measurements are in
-[merge_api_results/leaf_size_8way.csv](merge_api_results/leaf_size_8way.csv); the figure is
-reproducible with [plot_k4_leaf_size.py](plot_k4_leaf_size.py).
+The solid lines and error bars are the retained two-run direct-L2 sweep. Dashed star curves show the
+current production path at leaves 64, 128, and 256: FP16 inputs with FP32 accumulation/output for
+Wiki/OpenAI and native int8/int32 for YFCC. The new 64 and 256 points are means of two complete-query
+runs. The retained leaf-128 point has two float runs and one YFCC run. All values use the same
+merge-only boundary, excluding oracular partition construction.
 
-The tradeoff is consistent across datasets:
+The production table uses each production leaf-64 mean as its baseline. Actual values appear first;
+parentheses give the build-time percentage or absolute recall change.
 
-- Leaf 128 is the balanced setting. Recall improves by 0.005046 on Wiki, 0.009240 on OpenAI, and
-  0.006644 on YFCC. The float32 merge cost rises by 19.09–23.92%, while native-uint8 YFCC is
-  0.88% faster than leaf 64.
-- Leaf 256 gives the highest mean recall on every dataset: +0.007859 on Wiki, +0.015977 on OpenAI,
-  and +0.010989 on YFCC. Its merge-time cost is +62.97%, +74.53%, and only +2.09% respectively.
-- Leaf 512 adds substantial work without improving on leaf 256. Leaf 1024 is worse still: it costs
-  4.35x on Wiki and 4.89x on OpenAI, and recall falls below leaf 64 on Wiki and YFCC.
-- The likely cost mechanism is that doubling the leaf removes roughly one pivot level but doubles
-  the per-point leaf candidate comparisons. This favors low-dimensional native uint8 YFCC more
-  than the 768/1536-dimensional float datasets. The post-256 recall reversal suggests that forcing
-  some farther cross-origin bridges at smaller leaves helps navigation after CAGRA optimization;
-  this interpretation is an inference from the measured curve.
+| dataset | leaf 64 build | leaf 128 build | leaf 256 build | leaf 64 Recall@12 | leaf 128 Recall@12 | leaf 256 Recall@12 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Wiki-1M | 0.319 s (baseline) | 0.306 s (-3.97%) | 0.297 s (-6.75%) | 0.968671 (baseline) | 0.974541 (+0.005870) | 0.977404 (+0.008733) |
+| OpenAI-2M | 1.465 s (baseline) | 1.439 s (-1.75%) | 1.402 s (-4.26%) | 0.904088 (baseline) | 0.913450 (+0.009362) | 0.920127 (+0.016039) |
+| YFCC-10M (uint8) | 1.796 s (baseline) | 1.710 s (-4.79%) | 1.584 s (-11.79%) | 0.944493 (baseline) | 0.951047 (+0.006554) | 0.955469 (+0.010976) |
 
-Based on this sweep, the production default is now 128. Leaf 256 remains a recall-oriented
-alternative; sizes above 256 are dominated.
+The production result reverses the direct-L2 build-time trend through leaf 256: leaf 256 is both
+faster and higher-recall than leaf 128 on all three datasets. The likely reason is that fixed-size
+GEMMs exploit the larger matrices efficiently while the pivot tree emits fewer leaves and levels;
+the direct kernel instead pays the larger per-point candidate scan without the same GEMM efficiency.
+The retained direct-L2 topology results warn against extrapolating past 256: recall reverses by
+512/1024 while direct work rises sharply. Production GEMM at 512/1024 was not rerun. Leaf 256 is now
+the checked-in production default because it is faster and higher-recall than leaf 128 on all three
+production paths measured here.
+
+Raw legacy measurements are in
+[merge_api_results/leaf_size_8way.csv](merge_api_results/leaf_size_8way.csv). New and retained
+production runs are in
+[merge_api_results/leaf_size_production_8way.csv](merge_api_results/leaf_size_production_8way.csv),
+with means in
+[merge_api_results/leaf_size_production_summary.csv](merge_api_results/leaf_size_production_summary.csv).
+The figure is reproducible with [plot_k4_leaf_size.py](plot_k4_leaf_size.py).
+
+### Actual leaf-size distributions
+
+This retained distribution experiment used a configured maximum of 128, but the deterministic
+pivot tree rarely emitted a full leaf. Exact size frequencies were captured from the 8-way tree on
+every dataset; the counts sum to the complete dataset row count. The production default is now 256,
+so these histograms describe the earlier leaf-128 configuration rather than the new default.
+
+| dataset | rows | leaves | mean | median | p10-p90 | p95 | max | exactly 128 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Wiki-1M | 1,000,000 | 16,411 | 60.9 | 60 | 10-115 | 122 | 128 | 0.786% |
+| OpenAI-2M | 2,321,096 | 33,736 | 68.8 | 70 | 20-117 | 123 | 128 | 0.827% |
+| YFCC-10M | 10,000,000 | 143,799 | 69.5 | 71 | 20-116 | 122 | 128 | 0.777% |
+
+![Actual eight-way pivot-tree leaf-size histograms](merge_api_results/plots/k4_leaf_size_histograms_8way.png)
+
+Padding every leaf to 128 therefore represents 2.10x the actual Wiki point count, 1.86x OpenAI,
+and 1.84x YFCC. This explains why workspace in that experiment was governed by the configured
+maximum rather than the mean leaf size. Exact counts and statistics are in
+[merge_api_results/leaf_size_histogram_8way.csv](merge_api_results/leaf_size_histogram_8way.csv)
+and
+[merge_api_results/leaf_size_distribution_summary.csv](merge_api_results/leaf_size_distribution_summary.csv);
+the figure is reproducible with
+[plot_k4_leaf_distribution.py](plot_k4_leaf_distribution.py).
 
 ## Leaf-distance matrix study at 8-way fan-in
 
 The leaf-128 kernel previously evaluated every directed candidate independently, so each
-cross-origin unordered pair was loaded and evaluated twice. Four alternatives were run at 8-way
-fan-in on every dataset:
+cross-origin unordered pair was loaded and evaluated twice. Four baseline alternatives were run at 8-way fan-in on every dataset, plus a fifth
+float-only mixed-precision variant:
 
 - **Direct L2:** the committed control, one thread per point.
 - **Symmetric L2:** compute each unordered pair once into the 8,128-entry triangular shared-memory
@@ -198,6 +234,9 @@ fan-in on every dataset:
 - **Batched GEMM:** gather leaf vectors, form full 128×128 Gram matrices with cuBLAS, then run a
   small top-k selection kernel. Float uses standard FP32 compute. Uint8 is centered into int8 and
   accumulated exactly into int32.
+- **Mixed FP16/FP32 GEMM (float only):** quantize gathered float vectors to FP16, multiply with
+  FP32 accumulation and FP32 Gram output, then use the same float top-k kernel. The 1 GiB variant
+  deliberately halves the bounded allocation relative to production FP32.
 
 The table below uses the exact production-object run and its contemporaneous direct-L2 control.
 Each optimized cell gives its actual value first and its change from direct L2 in parentheses.
@@ -231,7 +270,8 @@ shown first; parentheses are changes from the direct-L2 row for that dataset.
 
 Following the report's plotting convention, the figure uses scratch CAGRA construction as the
 build-time, QPS, and recall baseline; the tables above use direct L2 to isolate the leaf-kernel
-change.
+change. The red float-only bars are the mean of two mixed-precision 1 GiB runs. The fourth panel
+shows the actual bounded allocation and labels the padded bytes required per leaf.
 
 The symmetric kernels halve distance evaluations, but their 32 KiB triangular matrix lowers
 occupancy and adds a matrix write plus a second scan. They therefore range from neutral to 10.40%
@@ -248,26 +288,68 @@ instead processes leaf batches with a 2 GiB aggregate cap. The cap had no measur
 unbounded trials. A 512 MiB alternative was only 1.0% slower than 2 GiB on OpenAI and 0.7% slower
 on YFCC, but 2 GiB is retained for the larger GEMM batches.
 
+### Half-precision float GEMM experiment
+
+The robust half-precision variant stores gathered vectors in FP16 but retains FP32 accumulation and
+FP32 Gram output. This retained precision experiment used leaf size 128; the production leaf default
+is now 256. Keeping the Gram output in FP32 avoids the cancellation and range loss of storing dot
+products in FP16.
+Each value below is an actual mean; parentheses compare to the contemporaneous FP32 control for the
+same dataset.
+
+| dataset | FP32, 2 GiB | mixed, 2 GiB | mixed, 1 GiB | 1 GiB Recall@12 | 1 GiB QPS |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Wiki-1M | 0.319 s | 0.304 s (-4.51%) | 0.306 s (-3.81%) | 0.974541 (+0.000057) | 67,019 (-0.19%) |
+| OpenAI-2M | 1.485 s | 1.421 s (-4.28%) | 1.439 s (-3.08%) | 0.913450 (+0.000188) | 32,738 (-0.04%) |
+
+The storage reduction is material even with FP32 output:
+
+| dataset | FP32 bytes / padded leaf | mixed bytes / padded leaf | per-leaf reduction | FP32 allocation | mixed allocation |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Wiki-1M | 448 KiB | 256 KiB | 42.86% | 2.000 GiB | 1.000 GiB |
+| OpenAI-2M | 832 KiB | 448 KiB | 46.15% | 2.000 GiB | 1.000 GiB |
+
+The 1 GiB path needs five instead of four Wiki batches and 15 instead of 14 OpenAI batches, yet is
+still 3.1-3.8% faster end to end. Keeping a 2 GiB cap extracts another 0.7% on Wiki and 1.2% on
+OpenAI, so the results expose a clean speed-versus-peak-memory choice.
+
+A maximum-savings Wiki probe also stored the Gram matrix in FP16. It built in 0.372 s, 16.71% slower
+than FP32, and reached 0.974150 Recall@12 (-0.000334). That path is rejected. The mixed path remains
+compile-time opt-in rather than the production default because FP16 input quantization can change
+the scaffold graph even though full-query recall was neutral in these runs. Define
+`CUVS_CAGRA_MERGE_FLOAT_GEMM_FP16_INPUT` to enable it; the optional
+`CUVS_CAGRA_MERGE_LEAF_GEMM_WORKSPACE_BYTES` definition selects the byte cap, and
+`CUVS_CAGRA_MERGE_LEAF_SIZE` supports isolated leaf-size builds around the production default of 256.
+Raw repeated measurements and workspace accounting are in
+[merge_api_results/leaf_gemm_precision_8way.csv](merge_api_results/leaf_gemm_precision_8way.csv)
+and
+[merge_api_results/leaf_gemm_precision_summary.csv](merge_api_results/leaf_gemm_precision_summary.csv).
+
 ### Leaf-stage profile
 
-Nsight Systems 2026.3.1 captured only `merge()` on Wiki-1M at 8-way fan-in. The ordinary control
-and production runs are reported above; profile instrumentation changed their wall times to
-479.488 ms and 326.457 ms. GPU leaf work changes as follows:
+The retained direct-L2 row comes from the earlier Nsight Systems capture. The installed Nsight 2022
+importer cannot decode the current CUDA 13 driver trace, so the refreshed FP32-versus-mixed rows use
+the same opt-in CUDA-event boundaries around gather, GEMM, and top-k. This gives a direct
+precision comparison without inferring stage time from the end-to-end wall clock.
 
 | implementation | gather | distance/Gram matrix | top-k selection | total leaf GPU time |
 | --- | ---: | ---: | ---: | ---: |
-| direct L2 | — | 183.625 ms | included | 183.625 ms |
-| FP32 GEMM | 8.372 ms | 13.461 ms | 0.477 ms | 22.309 ms (8.23x faster) |
+| direct L2 (retained Nsight) | - | 183.625 ms | included | 183.625 ms |
+| FP32 GEMM (CUDA events) | 11.319 ms | 13.792 ms | 0.647 ms | 25.758 ms |
+| FP16 input / FP32 accumulate (CUDA events) | 9.044 ms | 7.445 ms | 0.719 ms | 17.207 ms |
 
 ![Wiki eight-way leaf-stage profile](merge_api_results/plots/k4_leaf_distance_profile.png)
 
-The 161.3 ms leaf-stage reduction accounts for the 153.0 ms profiled wall-time reduction; the
-small difference is allocation/library overhead and run variation. Raw curated profile values are
-in
+Mixed precision reduces the identically measured leaf stage by 33.2% (1.50x) relative to FP32.
+The GEMM itself is 1.85x faster and the smaller gather output is 1.25x faster; top-k is effectively
+unchanged. Profiled merge wall time was 317.759 ms for FP32 and 309.425 ms for the 1 GiB mixed path.
+The direct-L2 retained profile was 479.488 ms.
+
+Raw curated profile values are in
 [merge_api_results/leaf_distance_profile_8way_wiki.csv](merge_api_results/leaf_distance_profile_8way_wiki.csv).
-All method, precision, workspace, and repeated GEMM trials are retained in
-[merge_api_results/leaf_distance_8way.csv](merge_api_results/leaf_distance_8way.csv), and the plots
-are reproducible with [plot_k4_leaf_distance.py](plot_k4_leaf_distance.py).
+The refreshed distance and profile plots are reproducible with
+[plot_k4_leaf_distance.py](plot_k4_leaf_distance.py) using `--skip-origin`; that flag deliberately
+leaves the diversity figures untouched.
 
 ## Origin-diverse scaffold neighbors
 

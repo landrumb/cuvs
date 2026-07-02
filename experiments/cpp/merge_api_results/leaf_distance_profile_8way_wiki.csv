@@ -1,5 +1,8 @@
-implementation,merge_wall_ms,operation,gpu_time_ms,calls
-direct-l2,479.487682,direct leaf L2,183.625308,1
-gemm-fp32,326.456782,gather leaf vectors,8.371567,1
-gemm-fp32,326.456782,batched FP32 GEMM,13.460842,1
-gemm-fp32,326.456782,Gram top-k selection,0.476547,1
+implementation,merge_wall_ms,operation,gpu_time_ms,calls,measurement
+direct-l2,479.487682,direct leaf L2,183.625308,1,Nsight Systems
+gemm-fp32-events,317.759456,gather leaf vectors,11.3189,1,CUDA events
+gemm-fp32-events,317.759456,batched GEMM,13.7916,1,CUDA events
+gemm-fp32-events,317.759456,Gram top-k selection,0.647072,1,CUDA events
+gemm-fp16-events,309.425240,gather leaf vectors,9.04371,1,CUDA events
+gemm-fp16-events,309.425240,batched GEMM,7.44512,1,CUDA events
+gemm-fp16-events,309.425240,Gram top-k selection,0.718688,1,CUDA events
