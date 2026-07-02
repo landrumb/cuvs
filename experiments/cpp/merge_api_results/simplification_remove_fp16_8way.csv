@@ -1,0 +1,4 @@
+dataset,parts,implementation,dtype,rows,queries,graph_degree,intermediate_graph_degree,itopk,oracle_partition_build_ms_excluded,merge_api_e2e_ms,search_ms,recall,qps
+Wiki-1M,8,no-fp16-experiments-r1,float32,1000000,10000,64,128,160,12215.370940,317.639537,148.282064,0.976975,67439.039694
+OpenAI-2M,8,no-fp16-experiments-r1,float32,2321096,20000,64,128,160,44591.890396,1486.448682,610.322478,0.920663,32769.561537
+YFCC-10M,8,no-fp16-experiments-r1,uint8,10000000,100000,64,128,160,21868.643482,1598.043565,283.591680,0.955462,352619.653722

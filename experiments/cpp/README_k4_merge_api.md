@@ -164,13 +164,14 @@ Recall@12 are shown first.
 
 ![Eight-way leaf-size build-time and recall tradeoff](merge_api_results/plots/k4_leaf_size_8way.png)
 
-The solid lines and error bars are the retained two-run direct-L2 sweep. Dashed star curves show the
-current production path at leaves 64, 128, and 256: FP16 inputs with FP32 accumulation/output for
-Wiki/OpenAI and native int8/int32 for YFCC. The new 64 and 256 points are means of two complete-query
-runs. The retained leaf-128 point has two float runs and one YFCC run. All values use the same
-merge-only boundary, excluding oracular partition construction.
+The solid lines and error bars are the retained two-run direct-L2 sweep. Dashed star curves show
+historical production-GEMM experiments at leaves 64, 128, and 256: FP16 inputs with FP32
+accumulation/output for Wiki/OpenAI and native int8/int32 for YFCC. The mixed-precision branches
+are no longer in production; the current float path is FP32. The leaf-64 and leaf-256 points are
+means of two complete-query runs, while leaf 128 has two float runs and one YFCC run. All values use
+the same merge-only boundary, excluding oracular partition construction.
 
-The production table uses each production leaf-64 mean as its baseline. Actual values appear first;
+The historical production-path table uses each production leaf-64 mean as its baseline. Actual values appear first;
 parentheses give the build-time percentage or absolute recall change.
 
 | dataset | leaf 64 build | leaf 128 build | leaf 256 build | leaf 64 Recall@12 | leaf 128 Recall@12 | leaf 256 Recall@12 |
@@ -179,18 +180,18 @@ parentheses give the build-time percentage or absolute recall change.
 | OpenAI-2M | 1.465 s (baseline) | 1.439 s (-1.75%) | 1.402 s (-4.26%) | 0.904088 (baseline) | 0.913450 (+0.009362) | 0.920127 (+0.016039) |
 | YFCC-10M (uint8) | 1.796 s (baseline) | 1.710 s (-4.79%) | 1.584 s (-11.79%) | 0.944493 (baseline) | 0.951047 (+0.006554) | 0.955469 (+0.010976) |
 
-The production result reverses the direct-L2 build-time trend through leaf 256: leaf 256 is both
+That historical production experiment reverses the direct-L2 build-time trend through leaf 256: leaf 256 is both
 faster and higher-recall than leaf 128 on all three datasets. The likely reason is that fixed-size
 GEMMs exploit the larger matrices efficiently while the pivot tree emits fewer leaves and levels;
 the direct kernel instead pays the larger per-point candidate scan without the same GEMM efficiency.
 The retained direct-L2 topology results warn against extrapolating past 256: recall reverses by
-512/1024 while direct work rises sharply. Production GEMM at 512/1024 was not rerun. Leaf 256 is now
-the checked-in production default because it is faster and higher-recall than leaf 128 on all three
-production paths measured here.
+512/1024 while direct work rises sharply. Production GEMM at 512/1024 was not rerun. Leaf 256 is
+the checked-in production default because every measured path improves recall over leaf 128. The
+historical mixed-precision table also improved build time on all three datasets; current production
+retains standard-precision FP32 for float data.
 
 Raw legacy measurements are in
-[merge_api_results/leaf_size_8way.csv](merge_api_results/leaf_size_8way.csv). New and retained
-production runs are in
+[merge_api_results/leaf_size_8way.csv](merge_api_results/leaf_size_8way.csv). Historical production-path runs are in
 [merge_api_results/leaf_size_production_8way.csv](merge_api_results/leaf_size_production_8way.csv),
 with means in
 [merge_api_results/leaf_size_production_summary.csv](merge_api_results/leaf_size_production_summary.csv).
@@ -219,6 +220,68 @@ and
 [merge_api_results/leaf_size_distribution_summary.csv](merge_api_results/leaf_size_distribution_summary.csv);
 the figure is reproducible with
 [plot_k4_leaf_distribution.py](plot_k4_leaf_distribution.py).
+
+### Pivot split-policy comparison
+
+Two deterministic leaf-128 variants were run through the same GPU pivot tree and compared with the
+retained nearest-pivot baseline:
+
+- **Score sort + midpoint:** sort each active node by the L2Expanded score
+  `d(x, a) - d(x, b)`, then split the sorted range at `floor(n / 2)`.
+- **Balanced two-pass pivots:** run nearest-pivot assignment once, select two deterministic retry
+  pivots from the larger first-pass side, assign the original node again, and retain the assignment
+  with smaller `|left - right|`. The first assignment wins ties.
+
+All runs use seed 1234 and cover every dataset row. The midpoint policy produces nearly fixed-size
+leaves because its child counts are determined by range bisection; the distance score determines
+which points occupy those leaves. The balanced retry preserves nearest-pivot boundaries while
+reducing the number of small leaves.
+
+| dataset | split policy | leaves | mean | median | p10-p90 | max |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Wiki-1M | nearest-pivot baseline | 16,411 | 60.9 | 60 | 10-115 | 128 |
+| Wiki-1M | score sort + midpoint | 8,192 | 122.1 | 122 | 122-122 | 123 |
+| Wiki-1M | balanced two-pass pivots | 13,415 | 74.5 | 77 | 29-116 | 128 |
+| OpenAI-2M | nearest-pivot baseline | 33,736 | 68.8 | 70 | 20-117 | 128 |
+| OpenAI-2M | score sort + midpoint | 32,768 | 70.8 | 71 | 70-71 | 71 |
+| OpenAI-2M | balanced two-pass pivots | 28,964 | 80.1 | 82 | 42-117 | 128 |
+| YFCC-10M | nearest-pivot baseline | 143,799 | 69.5 | 71 | 20-116 | 128 |
+| YFCC-10M | score sort + midpoint | 131,072 | 76.3 | 76 | 76-77 | 77 |
+| YFCC-10M | balanced two-pass pivots | 124,926 | 80.0 | 81 | 41-117 | 128 |
+
+![Transparent pivot split-policy leaf-size overlays](merge_api_results/plots/k4_leaf_size_pivot_variants_8way.png)
+
+The full-scale top row retains the midpoint spikes; the lower row zooms to the baseline and
+two-pass range. Exact 128-bin frequencies are in
+[leaf_size_pivot_variants_histogram_8way.csv](merge_api_results/leaf_size_pivot_variants_histogram_8way.csv),
+summary statistics are in
+[leaf_size_pivot_variants_summary.csv](merge_api_results/leaf_size_pivot_variants_summary.csv), and
+the figure is reproducible with
+[plot_k4_leaf_pivot_variants.py](plot_k4_leaf_pivot_variants.py).
+
+The public merge benchmark was then run twice per policy at 8-way fan-in with complete query and
+ground-truth sets. Float datasets use the standard FP32 GEMM leaf path; YFCC uses native
+int8/int32 GEMM. Times are the merge-only `merge_api_e2e_ms` boundary, with fresh oracle partition
+construction excluded. Parentheses compare each two-run mean with its contemporaneous baseline.
+
+| dataset | split policy | merge build | Recall@12 |
+| --- | --- | ---: | ---: |
+| Wiki-1M | nearest-pivot baseline | 0.320 s | 0.973834 |
+| Wiki-1M | score sort + midpoint | 0.283 s (-11.44%) | 0.973629 (-0.000205) |
+| Wiki-1M | balanced two-pass pivots | 0.349 s (+9.10%) | 0.973234 (-0.000600) |
+| OpenAI-2M | nearest-pivot baseline | 1.484 s | 0.913323 |
+| OpenAI-2M | score sort + midpoint | 1.436 s (-3.19%) | 0.908932 (-0.004392) |
+| OpenAI-2M | balanced two-pass pivots | 1.656 s (+11.63%) | 0.912215 (-0.001109) |
+| YFCC-10M | nearest-pivot baseline | 1.670 s | 0.950950 |
+| YFCC-10M | score sort + midpoint | 1.559 s (-6.67%) | 0.948619 (-0.002331) |
+| YFCC-10M | balanced two-pass pivots | 1.869 s (+11.91%) | 0.950543 (-0.000408) |
+
+Score-midpoint reduces build time on every dataset but gives back recall, materially so on OpenAI
+and YFCC. Balanced retry is slower and slightly lower-recall on every dataset, so the existing
+nearest-pivot policy dominates it in this end-to-end test. Raw runs are in
+[pivot_tree_variants_8way.csv](merge_api_results/pivot_tree_variants_8way.csv), with means, ranges,
+and baseline deltas in
+[pivot_tree_variants_8way_summary.csv](merge_api_results/pivot_tree_variants_8way_summary.csv).
 
 ## Leaf-distance matrix study at 8-way fan-in
 
@@ -314,12 +377,12 @@ still 3.1-3.8% faster end to end. Keeping a 2 GiB cap extracts another 0.7% on W
 OpenAI, so the results expose a clean speed-versus-peak-memory choice.
 
 A maximum-savings Wiki probe also stored the Gram matrix in FP16. It built in 0.372 s, 16.71% slower
-than FP32, and reached 0.974150 Recall@12 (-0.000334). That path is rejected. The mixed path remains
-compile-time opt-in rather than the production default because FP16 input quantization can change
-the scaffold graph even though full-query recall was neutral in these runs. Define
-`CUVS_CAGRA_MERGE_FLOAT_GEMM_FP16_INPUT` to enable it; the optional
-`CUVS_CAGRA_MERGE_LEAF_GEMM_WORKSPACE_BYTES` definition selects the byte cap, and
-`CUVS_CAGRA_MERGE_LEAF_SIZE` supports isolated leaf-size builds around the production default of 256.
+than FP32, and reached 0.974150 Recall@12 (-0.000334). That path is rejected.
+The mixed path was not retained because FP16 input quantization can change the scaffold graph even
+though full-query recall was neutral in these runs. Its experiment-only compile-time branches have
+now been removed from the production header; the measurements remain as historical evidence.
+The internal scaffold builder now accepts the workspace byte cap at runtime. The production leaf
+size is fixed at the retained compile-time value of 256 because it shapes kernel resources.
 Raw repeated measurements and workspace accounting are in
 [merge_api_results/leaf_gemm_precision_8way.csv](merge_api_results/leaf_gemm_precision_8way.csv)
 and
@@ -328,7 +391,7 @@ and
 ### Leaf-stage profile
 
 The retained direct-L2 row comes from the earlier Nsight Systems capture. The installed Nsight 2022
-importer cannot decode the current CUDA 13 driver trace, so the refreshed FP32-versus-mixed rows use
+importer cannot decode the current CUDA 13 driver trace, so the historical FP32-versus-mixed rows used
 the same opt-in CUDA-event boundaries around gather, GEMM, and top-k. This gives a direct
 precision comparison without inferring stage time from the end-to-end wall clock.
 

@@ -17,8 +17,6 @@
 
 #include <rmm/device_uvector.hpp>
 
-#include <cuda_fp16.h>
-
 #include <thrust/device_ptr.h>
 #include <thrust/execution_policy.h>
 #include <thrust/sequence.h>
@@ -26,133 +24,28 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
-#include <cstdlib>
-#include <fstream>
 #include <limits>
 #include <type_traits>
 #include <vector>
 
 namespace cuvs::neighbors::cagra::detail::merge_scaffold {
 
-inline constexpr int k_degree = 4;
-#ifdef CUVS_CAGRA_MERGE_LEAF_SIZE
-inline constexpr int k_cluster_size = CUVS_CAGRA_MERGE_LEAF_SIZE;
-#else
+inline constexpr int k_degree       = 4;
 inline constexpr int k_cluster_size = 256;
-#endif
-inline constexpr int k_max_cluster = k_cluster_size;
 static_assert(k_cluster_size > 0 && k_cluster_size <= 1024);
-inline constexpr int k_pivot_assign_chunk    = 256;
-inline constexpr int k_leaf_assign_chunk     = 1024;
-inline constexpr int k_pivot_block_size      = 128;
-inline constexpr int k_max_pivot_tree_levels = 64;
-inline constexpr uint64_t k_seed             = 1234;
-inline constexpr float k_inf                 = 3.4028234663852886e38f;
-#ifdef CUVS_CAGRA_MERGE_LEAF_GEMM_WORKSPACE_BYTES
-inline constexpr size_t k_leaf_gemm_workspace_bytes = CUVS_CAGRA_MERGE_LEAF_GEMM_WORKSPACE_BYTES;
-#else
-inline constexpr size_t k_leaf_gemm_workspace_bytes = size_t{2} * 1024 * 1024 * 1024;
-#endif
+inline constexpr int k_pivot_block_size = 128;
+
+struct build_params {
+  int pivot_assign_chunk           = 256;
+  int leaf_assign_chunk            = 1024;
+  int max_pivot_tree_levels        = 64;
+  uint64_t seed                    = 1234;
+  size_t leaf_gemm_workspace_bytes = size_t{2} * 1024 * 1024 * 1024;
+};
 
 struct host_range {
   int64_t start = 0;
   int64_t end   = 0;
-};
-
-inline void maybe_write_leaf_sizes(std::vector<host_range> const& leaves)
-{
-  auto const* path = std::getenv("CUVS_CAGRA_MERGE_LEAF_SIZES_CSV");
-  if (path == nullptr || path[0] == '\0') { return; }
-  std::ofstream output(path, std::ios::trunc);
-  RAFT_EXPECTS(output.good(), "Could not open CUVS_CAGRA_MERGE_LEAF_SIZES_CSV output");
-  output << "leaf_id,start,end,size\n";
-  for (size_t i = 0; i < leaves.size(); ++i) {
-    output << i << ',' << leaves[i].start << ',' << leaves[i].end << ','
-           << leaves[i].end - leaves[i].start << '\n';
-  }
-  RAFT_EXPECTS(output.good(), "Could not write CUVS_CAGRA_MERGE_LEAF_SIZES_CSV output");
-}
-
-inline void maybe_write_workspace(char const* representation,
-                                  int64_t dimension,
-                                  size_t leaf_count,
-                                  size_t vector_bytes_per_leaf,
-                                  size_t gram_bytes_per_leaf,
-                                  size_t batch_capacity)
-{
-  auto const* path = std::getenv("CUVS_CAGRA_MERGE_WORKSPACE_CSV");
-  if (path == nullptr || path[0] == '\0') { return; }
-  std::ofstream output(path, std::ios::trunc);
-  RAFT_EXPECTS(output.good(), "Could not open CUVS_CAGRA_MERGE_WORKSPACE_CSV output");
-  auto const bytes_per_leaf = vector_bytes_per_leaf + gram_bytes_per_leaf;
-  auto const batches        = (leaf_count + batch_capacity - 1) / batch_capacity;
-  output << "representation,dimension,max_leaf_size,leaf_count,vector_bytes_per_leaf,"
-            "gram_bytes_per_leaf,total_bytes_per_leaf,batch_capacity,allocated_workspace_bytes,"
-            "workspace_cap_bytes,batches\n";
-  output << representation << ',' << dimension << ',' << k_max_cluster << ',' << leaf_count << ','
-         << vector_bytes_per_leaf << ',' << gram_bytes_per_leaf << ',' << bytes_per_leaf << ','
-         << batch_capacity << ',' << batch_capacity * bytes_per_leaf << ','
-         << k_leaf_gemm_workspace_bytes << ',' << batches << '\n';
-  RAFT_EXPECTS(output.good(), "Could not write CUVS_CAGRA_MERGE_WORKSPACE_CSV output");
-}
-
-struct optional_leaf_stage_profiler {
-  explicit optional_leaf_stage_profiler(cudaStream_t stream) : stream_{stream}
-  {
-    auto const* path = std::getenv("CUVS_CAGRA_MERGE_LEAF_PROFILE_CSV");
-    if (path == nullptr || path[0] == '\0') { return; }
-    path_ = path;
-    RAFT_CUDA_TRY(cudaEventCreate(&start_));
-    RAFT_CUDA_TRY(cudaEventCreate(&stop_));
-  }
-
-  optional_leaf_stage_profiler(optional_leaf_stage_profiler const&)            = delete;
-  optional_leaf_stage_profiler& operator=(optional_leaf_stage_profiler const&) = delete;
-
-  ~optional_leaf_stage_profiler()
-  {
-    if (start_ != nullptr) { cudaEventDestroy(start_); }
-    if (stop_ != nullptr) { cudaEventDestroy(stop_); }
-  }
-
-  bool enabled() const { return start_ != nullptr; }
-
-  void begin()
-  {
-    if (enabled()) { RAFT_CUDA_TRY(cudaEventRecord(start_, stream_)); }
-  }
-
-  float end()
-  {
-    if (!enabled()) { return 0.0f; }
-    RAFT_CUDA_TRY(cudaEventRecord(stop_, stream_));
-    RAFT_CUDA_TRY(cudaEventSynchronize(stop_));
-    float elapsed = 0.0f;
-    RAFT_CUDA_TRY(cudaEventElapsedTime(&elapsed, start_, stop_));
-    return elapsed;
-  }
-
-  void write(char const* representation) const
-  {
-    if (!enabled()) { return; }
-    std::ofstream output(path_, std::ios::trunc);
-    RAFT_EXPECTS(output.good(), "Could not open CUVS_CAGRA_MERGE_LEAF_PROFILE_CSV output");
-    output << "representation,operation,gpu_time_ms\n";
-    output << representation << ",gather leaf vectors," << gather_ms << '\n';
-    output << representation << ",batched GEMM," << gemm_ms << '\n';
-    output << representation << ",Gram top-k selection," << topk_ms << '\n';
-    RAFT_EXPECTS(output.good(), "Could not write CUVS_CAGRA_MERGE_LEAF_PROFILE_CSV output");
-  }
-
-  float gather_ms = 0.0f;
-  float gemm_ms   = 0.0f;
-  float topk_ms   = 0.0f;
-
- private:
-  cudaStream_t stream_ = nullptr;
-  cudaEvent_t start_   = nullptr;
-  cudaEvent_t stop_    = nullptr;
-  char const* path_    = nullptr;
 };
 
 struct pivot_chunk {
@@ -191,6 +84,7 @@ inline std::vector<host_range> split_large_ranges(std::vector<host_range> const&
 
 inline int make_pivot_chunks(std::vector<host_range> const& ranges,
                              int level,
+                             build_params const& params,
                              std::vector<pivot_chunk>& chunks)
 {
   int active_count = 0;
@@ -205,10 +99,10 @@ inline int make_pivot_chunks(std::vector<host_range> const& ranges,
     bool active       = n > k_cluster_size;
     uint32_t pivot_a  = 0;
     uint32_t pivot_b  = 0;
-    int chunk_size    = active ? k_pivot_assign_chunk : k_leaf_assign_chunk;
+    int chunk_size    = active ? params.pivot_assign_chunk : params.leaf_assign_chunk;
 
     if (active) {
-      uint64_t h    = splitmix64(k_seed ^ (uint64_t(level) * 0x94d049bb133111ebull) ^
+      uint64_t h    = splitmix64(params.seed ^ (uint64_t(level) * 0x94d049bb133111ebull) ^
                               (uint64_t(r) * 0x9e3779b97f4a7c15ull));
       int64_t off_a = static_cast<int64_t>(h % static_cast<uint64_t>(n));
       int64_t off_b = static_cast<int64_t>(splitmix64(h) % static_cast<uint64_t>(n));
@@ -310,34 +204,16 @@ __device__ float l2_distance(T const* dataset, int64_t dim, uint32_t a, uint32_t
   float acc   = 0.0f;
   T const* pa = dataset + static_cast<int64_t>(a) * dim;
   T const* pb = dataset + static_cast<int64_t>(b) * dim;
-  if constexpr (std::is_same_v<T, float>) {
-    if (dim % 4 == 0 && reinterpret_cast<uintptr_t>(pa) % alignof(float4) == 0 &&
-        reinterpret_cast<uintptr_t>(pb) % alignof(float4) == 0) {
-      auto pa4 = reinterpret_cast<float4 const*>(pa);
-      auto pb4 = reinterpret_cast<float4 const*>(pb);
+  if constexpr (std::is_same_v<T, float> || std::is_same_v<T, uint8_t>) {
+    using vector_type = std::conditional_t<std::is_same_v<T, float>, float4, uchar4>;
+    if (dim % 4 == 0 && reinterpret_cast<uintptr_t>(pa) % alignof(vector_type) == 0 &&
+        reinterpret_cast<uintptr_t>(pb) % alignof(vector_type) == 0) {
+      auto pa4 = reinterpret_cast<vector_type const*>(pa);
+      auto pb4 = reinterpret_cast<vector_type const*>(pb);
       for (int64_t d = 0; d < dim / 4; ++d) {
-        float4 va  = pa4[d];
-        float4 vb  = pb4[d];
-        float diff = va.x - vb.x;
-        acc += diff * diff;
-        diff = va.y - vb.y;
-        acc += diff * diff;
-        diff = va.z - vb.z;
-        acc += diff * diff;
-        diff = va.w - vb.w;
-        acc += diff * diff;
-      }
-      return acc;
-    }
-  } else if constexpr (std::is_same_v<T, uint8_t>) {
-    if (dim % 4 == 0 && reinterpret_cast<uintptr_t>(pa) % alignof(uchar4) == 0 &&
-        reinterpret_cast<uintptr_t>(pb) % alignof(uchar4) == 0) {
-      auto pa4 = reinterpret_cast<uchar4 const*>(pa);
-      auto pb4 = reinterpret_cast<uchar4 const*>(pb);
-      for (int64_t d = 0; d < dim / 4; ++d) {
-        uchar4 va  = pa4[d];
-        uchar4 vb  = pb4[d];
-        float diff = static_cast<float>(va.x) - static_cast<float>(vb.x);
+        vector_type va = pa4[d];
+        vector_type vb = pb4[d];
+        float diff     = static_cast<float>(va.x) - static_cast<float>(vb.x);
         acc += diff * diff;
         diff = static_cast<float>(va.y) - static_cast<float>(vb.y);
         acc += diff * diff;
@@ -370,49 +246,20 @@ __device__ void l2_distance_pair(T const* dataset,
   T const* point_p  = dataset + static_cast<int64_t>(point) * dim;
   T const* pivot_ap = dataset + static_cast<int64_t>(pivot_a) * dim;
   T const* pivot_bp = dataset + static_cast<int64_t>(pivot_b) * dim;
-  if constexpr (std::is_same_v<T, float>) {
-    if (dim % 4 == 0 && reinterpret_cast<uintptr_t>(point_p) % alignof(float4) == 0 &&
-        reinterpret_cast<uintptr_t>(pivot_ap) % alignof(float4) == 0 &&
-        reinterpret_cast<uintptr_t>(pivot_bp) % alignof(float4) == 0) {
-      auto point4   = reinterpret_cast<float4 const*>(point_p);
-      auto pivot_a4 = reinterpret_cast<float4 const*>(pivot_ap);
-      auto pivot_b4 = reinterpret_cast<float4 const*>(pivot_bp);
+  if constexpr (std::is_same_v<T, float> || std::is_same_v<T, uint8_t>) {
+    using vector_type = std::conditional_t<std::is_same_v<T, float>, float4, uchar4>;
+    if (dim % 4 == 0 && reinterpret_cast<uintptr_t>(point_p) % alignof(vector_type) == 0 &&
+        reinterpret_cast<uintptr_t>(pivot_ap) % alignof(vector_type) == 0 &&
+        reinterpret_cast<uintptr_t>(pivot_bp) % alignof(vector_type) == 0) {
+      auto point4   = reinterpret_cast<vector_type const*>(point_p);
+      auto pivot_a4 = reinterpret_cast<vector_type const*>(pivot_ap);
+      auto pivot_b4 = reinterpret_cast<vector_type const*>(pivot_bp);
       for (int64_t d = 0; d < dim / 4; ++d) {
-        float4 value = point4[d];
-        float4 va    = pivot_a4[d];
-        float4 vb    = pivot_b4[d];
-        float diff_a = value.x - va.x;
-        float diff_b = value.x - vb.x;
-        distance_a += diff_a * diff_a;
-        distance_b += diff_b * diff_b;
-        diff_a = value.y - va.y;
-        diff_b = value.y - vb.y;
-        distance_a += diff_a * diff_a;
-        distance_b += diff_b * diff_b;
-        diff_a = value.z - va.z;
-        diff_b = value.z - vb.z;
-        distance_a += diff_a * diff_a;
-        distance_b += diff_b * diff_b;
-        diff_a = value.w - va.w;
-        diff_b = value.w - vb.w;
-        distance_a += diff_a * diff_a;
-        distance_b += diff_b * diff_b;
-      }
-      return;
-    }
-  } else if constexpr (std::is_same_v<T, uint8_t>) {
-    if (dim % 4 == 0 && reinterpret_cast<uintptr_t>(point_p) % alignof(uchar4) == 0 &&
-        reinterpret_cast<uintptr_t>(pivot_ap) % alignof(uchar4) == 0 &&
-        reinterpret_cast<uintptr_t>(pivot_bp) % alignof(uchar4) == 0) {
-      auto point4   = reinterpret_cast<uchar4 const*>(point_p);
-      auto pivot_a4 = reinterpret_cast<uchar4 const*>(pivot_ap);
-      auto pivot_b4 = reinterpret_cast<uchar4 const*>(pivot_bp);
-      for (int64_t d = 0; d < dim / 4; ++d) {
-        uchar4 value = point4[d];
-        uchar4 va    = pivot_a4[d];
-        uchar4 vb    = pivot_b4[d];
-        float diff_a = static_cast<float>(value.x) - static_cast<float>(va.x);
-        float diff_b = static_cast<float>(value.x) - static_cast<float>(vb.x);
+        vector_type value = point4[d];
+        vector_type va    = pivot_a4[d];
+        vector_type vb    = pivot_b4[d];
+        float diff_a      = static_cast<float>(value.x) - static_cast<float>(va.x);
+        float diff_b      = static_cast<float>(value.x) - static_cast<float>(vb.x);
         distance_a += diff_a * diff_a;
         distance_b += diff_b * diff_b;
         diff_a = static_cast<float>(value.y) - static_cast<float>(va.y);
@@ -546,9 +393,9 @@ __global__ void leaf_cross_knn_kernel(T const* dataset,
   uint32_t start = leaf_starts[leaf];
   uint32_t end   = leaf_ends[leaf];
   int leaf_n     = static_cast<int>(end - start);
-  if (leaf_n <= 1 || leaf_n > k_max_cluster) { return; }
+  if (leaf_n <= 1 || leaf_n > k_cluster_size) { return; }
 
-  __shared__ uint32_t ids[k_max_cluster];
+  __shared__ uint32_t ids[k_cluster_size];
   for (int i = threadIdx.x; i < leaf_n; i += blockDim.x) {
     ids[i] = sorted_ids[start + i];
   }
@@ -560,7 +407,7 @@ __global__ void leaf_cross_knn_kernel(T const* dataset,
     uint8_t top_v[k_degree];
 #pragma unroll
     for (int t = 0; t < k_degree; ++t) {
-      top_d[t] = k_inf;
+      top_d[t] = std::numeric_limits<float>::max();
       top_v[t] = std::numeric_limits<uint8_t>::max();
     }
 
@@ -601,11 +448,11 @@ static __global__ void gather_float_leaf_vectors_kernel(float const* dataset,
 {
   int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-  int64_t total  = leaf_count * k_max_cluster * dim;
+  int64_t total  = leaf_count * k_cluster_size * dim;
   for (; linear < total; linear += stride) {
     int64_t d          = linear % dim;
-    int64_t local_row  = (linear / dim) % k_max_cluster;
-    int64_t local_leaf = linear / (dim * k_max_cluster);
+    int64_t local_row  = (linear / dim) % k_cluster_size;
+    int64_t local_leaf = linear / (dim * k_cluster_size);
     int64_t leaf       = leaf_offset + local_leaf;
     int64_t leaf_n     = static_cast<int64_t>(leaf_ends[leaf] - leaf_starts[leaf]);
     float value        = 0.0f;
@@ -616,35 +463,6 @@ static __global__ void gather_float_leaf_vectors_kernel(float const* dataset,
     leaf_vectors[linear] = value;
   }
 }
-
-#ifdef CUVS_CAGRA_MERGE_FLOAT_GEMM_FP16_INPUT
-static __global__ void gather_float_leaf_vectors_fp16_kernel(float const* dataset,
-                                                             int64_t dim,
-                                                             uint32_t const* sorted_ids,
-                                                             uint32_t const* leaf_starts,
-                                                             uint32_t const* leaf_ends,
-                                                             int64_t leaf_offset,
-                                                             int64_t leaf_count,
-                                                             __half* leaf_vectors)
-{
-  int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-  int64_t total  = leaf_count * k_max_cluster * dim;
-  for (; linear < total; linear += stride) {
-    int64_t d          = linear % dim;
-    int64_t local_row  = (linear / dim) % k_max_cluster;
-    int64_t local_leaf = linear / (dim * k_max_cluster);
-    int64_t leaf       = leaf_offset + local_leaf;
-    int64_t leaf_n     = static_cast<int64_t>(leaf_ends[leaf] - leaf_starts[leaf]);
-    float value        = 0.0f;
-    if (local_row < leaf_n) {
-      uint32_t point = sorted_ids[leaf_starts[leaf] + local_row];
-      value          = dataset[static_cast<int64_t>(point) * dim + d];
-    }
-    leaf_vectors[linear] = __float2half_rn(value);
-  }
-}
-#endif
 
 template <typename T>
 __global__ void gather_integer_leaf_vectors_kernel(T const* dataset,
@@ -659,11 +477,11 @@ __global__ void gather_integer_leaf_vectors_kernel(T const* dataset,
 {
   int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-  int64_t total  = leaf_count * k_max_cluster * output_dim;
+  int64_t total  = leaf_count * k_cluster_size * output_dim;
   for (; linear < total; linear += stride) {
     int64_t d          = linear % output_dim;
-    int64_t local_row  = (linear / output_dim) % k_max_cluster;
-    int64_t local_leaf = linear / (output_dim * k_max_cluster);
+    int64_t local_row  = (linear / output_dim) % k_cluster_size;
+    int64_t local_leaf = linear / (output_dim * k_cluster_size);
     int64_t leaf       = leaf_offset + local_leaf;
     int8_t value       = 0;
     int64_t leaf_n     = static_cast<int64_t>(leaf_ends[leaf] - leaf_starts[leaf]);
@@ -681,25 +499,27 @@ __global__ void gather_integer_leaf_vectors_kernel(T const* dataset,
   }
 }
 
-static __global__ void leaf_gram_i32_knn_kernel(int32_t const* gram,
-                                                uint32_t const* sorted_ids,
-                                                uint32_t const* origins,
-                                                uint32_t const* leaf_starts,
-                                                uint32_t const* leaf_ends,
-                                                int64_t leaf_offset,
-                                                int64_t leaf_count,
-                                                uint32_t* graph,
-                                                uint8_t* degrees)
+template <typename GramT>
+static __global__ void leaf_gram_knn_kernel(GramT const* gram,
+                                            uint32_t const* sorted_ids,
+                                            uint32_t const* origins,
+                                            uint32_t const* leaf_starts,
+                                            uint32_t const* leaf_ends,
+                                            int64_t leaf_offset,
+                                            int64_t leaf_count,
+                                            uint32_t* graph,
+                                            uint8_t* degrees)
 {
+  static_assert(std::is_same_v<GramT, float> || std::is_same_v<GramT, int32_t>);
   int64_t local_leaf = blockIdx.x;
   if (local_leaf >= leaf_count) { return; }
   int64_t leaf   = leaf_offset + local_leaf;
   uint32_t start = leaf_starts[leaf];
   int leaf_n     = static_cast<int>(leaf_ends[leaf] - start);
-  if (leaf_n <= 1 || leaf_n > k_max_cluster) { return; }
+  if (leaf_n <= 1 || leaf_n > k_cluster_size) { return; }
 
-  __shared__ uint32_t ids[k_max_cluster];
-  __shared__ uint32_t leaf_origins[k_max_cluster];
+  __shared__ uint32_t ids[k_cluster_size];
+  __shared__ uint32_t leaf_origins[k_cluster_size];
   for (int i = threadIdx.x; i < leaf_n; i += blockDim.x) {
     ids[i]          = sorted_ids[start + i];
     leaf_origins[i] = origins[ids[i]];
@@ -708,22 +528,27 @@ static __global__ void leaf_gram_i32_knn_kernel(int32_t const* gram,
 
   int u = threadIdx.x;
   if (u >= leaf_n) { return; }
-  int32_t top_d[k_degree];
+  GramT top_d[k_degree];
   uint8_t top_v[k_degree];
 #pragma unroll
   for (int t = 0; t < k_degree; ++t) {
-    top_d[t] = std::numeric_limits<int32_t>::max();
+    top_d[t] = std::numeric_limits<GramT>::max();
     top_v[t] = std::numeric_limits<uint8_t>::max();
   }
 
-  int64_t gram_base = local_leaf * k_max_cluster * k_max_cluster;
-  int32_t norm_u    = gram[gram_base + u * k_max_cluster + u];
+  int64_t gram_base = local_leaf * k_cluster_size * k_cluster_size;
+  GramT norm_u      = gram[gram_base + u * k_cluster_size + u];
   for (int v = 0; v < leaf_n; ++v) {
     if (u == v || leaf_origins[u] == leaf_origins[v]) { continue; }
-    int32_t norm_v   = gram[gram_base + v * k_max_cluster + v];
-    int32_t dot      = gram[gram_base + v * k_max_cluster + u];
-    int32_t distance = norm_u + norm_v - 2 * dot;
-    int worst        = 0;
+    GramT norm_v = gram[gram_base + v * k_cluster_size + v];
+    GramT dot    = gram[gram_base + v * k_cluster_size + u];
+    GramT distance;
+    if constexpr (std::is_same_v<GramT, float>) {
+      distance = fmaxf(0.0f, fmaf(-2.0f, dot, norm_u + norm_v));
+    } else {
+      distance = norm_u + norm_v - 2 * dot;
+    }
+    int worst = 0;
 #pragma unroll
     for (int t = 1; t < k_degree; ++t) {
       if (top_d[t] > top_d[worst]) { worst = t; }
@@ -737,144 +562,15 @@ static __global__ void leaf_gram_i32_knn_kernel(int32_t const* gram,
   int selected = 0;
 #pragma unroll
   for (int t = 0; t < k_degree; ++t) {
-    if (top_v[t] != std::numeric_limits<uint8_t>::max()) {
+    bool valid = top_v[t] != std::numeric_limits<uint8_t>::max();
+    if constexpr (std::is_same_v<GramT, float>) { valid = valid && isfinite(top_d[t]); }
+    if (valid) {
       graph[static_cast<int64_t>(ids[u]) * k_degree + selected] = ids[top_v[t]];
       ++selected;
     }
   }
   degrees[ids[u]] = static_cast<uint8_t>(selected);
 }
-
-static __global__ void leaf_gram_f32_knn_kernel(float const* gram,
-                                                uint32_t const* sorted_ids,
-                                                uint32_t const* origins,
-                                                uint32_t const* leaf_starts,
-                                                uint32_t const* leaf_ends,
-                                                int64_t leaf_offset,
-                                                int64_t leaf_count,
-                                                uint32_t* graph,
-                                                uint8_t* degrees)
-{
-  int64_t local_leaf = blockIdx.x;
-  if (local_leaf >= leaf_count) { return; }
-  int64_t leaf   = leaf_offset + local_leaf;
-  uint32_t start = leaf_starts[leaf];
-  int leaf_n     = static_cast<int>(leaf_ends[leaf] - start);
-  if (leaf_n <= 1 || leaf_n > k_max_cluster) { return; }
-
-  __shared__ uint32_t ids[k_max_cluster];
-  __shared__ uint32_t leaf_origins[k_max_cluster];
-  for (int i = threadIdx.x; i < leaf_n; i += blockDim.x) {
-    ids[i]          = sorted_ids[start + i];
-    leaf_origins[i] = origins[ids[i]];
-  }
-  __syncthreads();
-
-  int u = threadIdx.x;
-  if (u >= leaf_n) { return; }
-  float top_d[k_degree];
-  uint8_t top_v[k_degree];
-#pragma unroll
-  for (int t = 0; t < k_degree; ++t) {
-    top_d[t] = k_inf;
-    top_v[t] = std::numeric_limits<uint8_t>::max();
-  }
-
-  int64_t gram_base = local_leaf * k_max_cluster * k_max_cluster;
-  float norm_u      = gram[gram_base + u * k_max_cluster + u];
-  for (int v = 0; v < leaf_n; ++v) {
-    if (u == v || leaf_origins[u] == leaf_origins[v]) { continue; }
-    float norm_v   = gram[gram_base + v * k_max_cluster + v];
-    float dot      = gram[gram_base + v * k_max_cluster + u];
-    float distance = fmaxf(0.0f, fmaf(-2.0f, dot, norm_u + norm_v));
-    int worst      = 0;
-#pragma unroll
-    for (int t = 1; t < k_degree; ++t) {
-      if (top_d[t] > top_d[worst]) { worst = t; }
-    }
-    if (distance < top_d[worst]) {
-      top_d[worst] = distance;
-      top_v[worst] = static_cast<uint8_t>(v);
-    }
-  }
-
-  int selected = 0;
-#pragma unroll
-  for (int t = 0; t < k_degree; ++t) {
-    if (isfinite(top_d[t]) && top_v[t] != std::numeric_limits<uint8_t>::max()) {
-      graph[static_cast<int64_t>(ids[u]) * k_degree + selected] = ids[top_v[t]];
-      ++selected;
-    }
-  }
-  degrees[ids[u]] = static_cast<uint8_t>(selected);
-}
-
-#if defined(CUVS_CAGRA_MERGE_FLOAT_GEMM_FP16_INPUT) && \
-  defined(CUVS_CAGRA_MERGE_FLOAT_GEMM_FP16_OUTPUT)
-static __global__ void leaf_gram_f16_knn_kernel(__half const* gram,
-                                                uint32_t const* sorted_ids,
-                                                uint32_t const* origins,
-                                                uint32_t const* leaf_starts,
-                                                uint32_t const* leaf_ends,
-                                                int64_t leaf_offset,
-                                                int64_t leaf_count,
-                                                uint32_t* graph,
-                                                uint8_t* degrees)
-{
-  int64_t local_leaf = blockIdx.x;
-  if (local_leaf >= leaf_count) { return; }
-  int64_t leaf   = leaf_offset + local_leaf;
-  uint32_t start = leaf_starts[leaf];
-  int leaf_n     = static_cast<int>(leaf_ends[leaf] - start);
-  if (leaf_n <= 1 || leaf_n > k_max_cluster) { return; }
-
-  __shared__ uint32_t ids[k_max_cluster];
-  __shared__ uint32_t leaf_origins[k_max_cluster];
-  for (int i = threadIdx.x; i < leaf_n; i += blockDim.x) {
-    ids[i]          = sorted_ids[start + i];
-    leaf_origins[i] = origins[ids[i]];
-  }
-  __syncthreads();
-
-  int u = threadIdx.x;
-  if (u >= leaf_n) { return; }
-  float top_d[k_degree];
-  uint8_t top_v[k_degree];
-#pragma unroll
-  for (int t = 0; t < k_degree; ++t) {
-    top_d[t] = k_inf;
-    top_v[t] = std::numeric_limits<uint8_t>::max();
-  }
-
-  int64_t gram_base = local_leaf * k_max_cluster * k_max_cluster;
-  float norm_u      = __half2float(gram[gram_base + u * k_max_cluster + u]);
-  for (int v = 0; v < leaf_n; ++v) {
-    if (u == v || leaf_origins[u] == leaf_origins[v]) { continue; }
-    float norm_v   = __half2float(gram[gram_base + v * k_max_cluster + v]);
-    float dot      = __half2float(gram[gram_base + v * k_max_cluster + u]);
-    float distance = fmaxf(0.0f, fmaf(-2.0f, dot, norm_u + norm_v));
-    int worst      = 0;
-#pragma unroll
-    for (int t = 1; t < k_degree; ++t) {
-      if (top_d[t] > top_d[worst]) { worst = t; }
-    }
-    if (distance < top_d[worst]) {
-      top_d[worst] = distance;
-      top_v[worst] = static_cast<uint8_t>(v);
-    }
-  }
-
-  int selected = 0;
-#pragma unroll
-  for (int t = 0; t < k_degree; ++t) {
-    if (isfinite(top_d[t]) && top_v[t] != std::numeric_limits<uint8_t>::max()) {
-      graph[static_cast<int64_t>(ids[u]) * k_degree + selected] = ids[top_v[t]];
-      ++selected;
-    }
-  }
-  degrees[ids[u]] = static_cast<uint8_t>(selected);
-}
-#endif
 
 static __global__ void pad_scaffold_kernel(uint32_t* graph,
                                            uint8_t* degrees,
@@ -897,13 +593,17 @@ static __global__ void pad_scaffold_kernel(uint32_t* graph,
 template <typename T>
 auto build(raft::resources const& res,
            raft::device_matrix_view<const T, int64_t, raft::row_major> dataset,
-           std::vector<int64_t> const& offsets) -> raft::device_matrix<uint32_t, int64_t>
+           std::vector<int64_t> const& offsets,
+           build_params const& params = {}) -> raft::device_matrix<uint32_t, int64_t>
 {
   auto stream  = raft::resource::get_cuda_stream(res);
   int64_t rows = dataset.extent(0);
   RAFT_EXPECTS(offsets.size() >= 3, "k=4 scaffold merge requires at least two input indices");
   RAFT_EXPECTS(rows <= static_cast<int64_t>(std::numeric_limits<uint32_t>::max()),
                "k=4 scaffold merge requires the merged row count to fit in uint32_t");
+  RAFT_EXPECTS(params.pivot_assign_chunk > 0 && params.leaf_assign_chunk > 0 &&
+                 params.max_pivot_tree_levels > 0,
+               "k=4 scaffold merge runtime chunk sizes and level cap must be positive");
 
   auto graph = raft::make_device_matrix<uint32_t, int64_t>(res, rows, k_degree);
   rmm::device_uvector<uint8_t> degrees(rows, stream);
@@ -941,8 +641,8 @@ auto build(raft::resources const& res,
   rmm::device_uvector<uint32_t> device_left_counts(0, stream);
   rmm::device_uvector<scatter_offset> device_scatter_offsets(0, stream);
 
-  for (int level = 0; level < k_max_pivot_tree_levels; ++level) {
-    int active_count = make_pivot_chunks(ranges, level, chunks);
+  for (int level = 0; level < params.max_pivot_tree_levels; ++level) {
+    int active_count = make_pivot_chunks(ranges, level, params, chunks);
     if (active_count == 0) { break; }
 
     device_chunks.resize(chunks.size(), stream);
@@ -979,7 +679,6 @@ auto build(raft::resources const& res,
   }
 
   auto leaves = split_large_ranges(ranges);
-  maybe_write_leaf_sizes(leaves);
   std::vector<uint32_t> starts_host(leaves.size());
   std::vector<uint32_t> ends_host(leaves.size());
   for (size_t i = 0; i < leaves.size(); ++i) {
@@ -999,133 +698,27 @@ auto build(raft::resources const& res,
     int64_t input_dimension = dataset.extent(1);
     if (input_dimension <= std::numeric_limits<int>::max()) {
       int dimension                   = static_cast<int>(input_dimension);
-      size_t vector_elements_per_leaf = static_cast<size_t>(k_max_cluster) * dimension;
-      size_t gram_elements_per_leaf   = static_cast<size_t>(k_max_cluster) * k_max_cluster;
-#ifdef CUVS_CAGRA_MERGE_FLOAT_GEMM_FP16_INPUT
-      size_t vector_bytes_per_leaf = vector_elements_per_leaf * sizeof(__half);
-#ifdef CUVS_CAGRA_MERGE_FLOAT_GEMM_FP16_OUTPUT
-      size_t gram_bytes_per_leaf = gram_elements_per_leaf * sizeof(__half);
-#else
-      size_t gram_bytes_per_leaf = gram_elements_per_leaf * sizeof(float);
-#endif
-      size_t bytes_per_leaf = vector_bytes_per_leaf + gram_bytes_per_leaf;
-      if (bytes_per_leaf <= k_leaf_gemm_workspace_bytes) {
+      size_t vector_elements_per_leaf = static_cast<size_t>(k_cluster_size) * dimension;
+      size_t gram_elements_per_leaf   = static_cast<size_t>(k_cluster_size) * k_cluster_size;
+      size_t vector_bytes_per_leaf    = vector_elements_per_leaf * sizeof(float);
+      size_t gram_bytes_per_leaf      = gram_elements_per_leaf * sizeof(float);
+      size_t bytes_per_leaf           = vector_bytes_per_leaf + gram_bytes_per_leaf;
+      if (bytes_per_leaf <= params.leaf_gemm_workspace_bytes) {
         size_t batch_capacity = std::max<size_t>(
-          1, std::min<size_t>(leaves.size(), k_leaf_gemm_workspace_bytes / bytes_per_leaf));
-        rmm::device_uvector<__half> leaf_vectors(batch_capacity * vector_elements_per_leaf, stream);
-#ifdef CUVS_CAGRA_MERGE_FLOAT_GEMM_FP16_OUTPUT
-        rmm::device_uvector<__half> gram(batch_capacity * gram_elements_per_leaf, stream);
-        constexpr cudaDataType_t gram_type = CUDA_R_16F;
-        auto const* representation         = "fp16-fp16";
-#else
-        rmm::device_uvector<float> gram(batch_capacity * gram_elements_per_leaf, stream);
-        constexpr cudaDataType_t gram_type = CUDA_R_32F;
-        auto const* representation         = "fp16-fp32";
-#endif
-        maybe_write_workspace(representation,
-                              input_dimension,
-                              leaves.size(),
-                              vector_bytes_per_leaf,
-                              gram_bytes_per_leaf,
-                              batch_capacity);
-        float alpha             = 1.0f;
-        float beta              = 0.0f;
-        long long vector_stride = static_cast<long long>(vector_elements_per_leaf);
-        long long gram_stride   = static_cast<long long>(gram_elements_per_leaf);
-        auto cublas_handle      = raft::resource::get_cublas_handle(res);
-        RAFT_CUBLAS_TRY(cublasSetPointerMode(cublas_handle, CUBLAS_POINTER_MODE_HOST));
-        optional_leaf_stage_profiler profiler(stream);
-        for (size_t leaf_offset = 0; leaf_offset < leaves.size(); leaf_offset += batch_capacity) {
-          size_t batch_size    = std::min(batch_capacity, leaves.size() - leaf_offset);
-          int64_t gather_items = static_cast<int64_t>(batch_size * vector_elements_per_leaf);
-          int gather_blocks =
-            static_cast<int>(std::min<int64_t>((gather_items + 255) / 256, 1048576));
-          profiler.begin();
-          gather_float_leaf_vectors_fp16_kernel<<<gather_blocks, 256, 0, stream>>>(
-            dataset.data_handle(),
-            dimension,
-            ids.data(),
-            starts.data(),
-            ends.data(),
-            static_cast<int64_t>(leaf_offset),
-            static_cast<int64_t>(batch_size),
-            leaf_vectors.data());
-          RAFT_CUDA_TRY(cudaGetLastError());
-          profiler.gather_ms += profiler.end();
-          profiler.begin();
-          RAFT_CUBLAS_TRY(cublasGemmStridedBatchedEx(cublas_handle,
-                                                     CUBLAS_OP_T,
-                                                     CUBLAS_OP_N,
-                                                     k_max_cluster,
-                                                     k_max_cluster,
-                                                     dimension,
-                                                     &alpha,
-                                                     leaf_vectors.data(),
-                                                     CUDA_R_16F,
-                                                     dimension,
-                                                     vector_stride,
-                                                     leaf_vectors.data(),
-                                                     CUDA_R_16F,
-                                                     dimension,
-                                                     vector_stride,
-                                                     &beta,
-                                                     gram.data(),
-                                                     gram_type,
-                                                     k_max_cluster,
-                                                     gram_stride,
-                                                     static_cast<int>(batch_size),
-                                                     CUBLAS_COMPUTE_32F,
-                                                     CUBLAS_GEMM_DEFAULT));
-          profiler.gemm_ms += profiler.end();
-          profiler.begin();
-#ifdef CUVS_CAGRA_MERGE_FLOAT_GEMM_FP16_OUTPUT
-          leaf_gram_f16_knn_kernel<<<static_cast<int>(batch_size), k_cluster_size, 0, stream>>>(
-#else
-          leaf_gram_f32_knn_kernel<<<static_cast<int>(batch_size), k_cluster_size, 0, stream>>>(
-#endif
-            gram.data(),
-            ids.data(),
-            origins.data(),
-            starts.data(),
-            ends.data(),
-            static_cast<int64_t>(leaf_offset),
-            static_cast<int64_t>(batch_size),
-            graph.data_handle(),
-            degrees.data());
-          RAFT_CUDA_TRY(cudaGetLastError());
-          profiler.topk_ms += profiler.end();
-        }
-        profiler.write(representation);
-        used_gemm = true;
-      }
-#else
-      size_t vector_bytes_per_leaf = vector_elements_per_leaf * sizeof(float);
-      size_t gram_bytes_per_leaf   = gram_elements_per_leaf * sizeof(float);
-      size_t bytes_per_leaf        = vector_bytes_per_leaf + gram_bytes_per_leaf;
-      if (bytes_per_leaf <= k_leaf_gemm_workspace_bytes) {
-        size_t batch_capacity = std::max<size_t>(
-          1, std::min<size_t>(leaves.size(), k_leaf_gemm_workspace_bytes / bytes_per_leaf));
+          1, std::min<size_t>(leaves.size(), params.leaf_gemm_workspace_bytes / bytes_per_leaf));
         rmm::device_uvector<float> leaf_vectors(batch_capacity * vector_elements_per_leaf, stream);
         rmm::device_uvector<float> gram(batch_capacity * gram_elements_per_leaf, stream);
-        maybe_write_workspace("fp32-fp32",
-                              input_dimension,
-                              leaves.size(),
-                              vector_bytes_per_leaf,
-                              gram_bytes_per_leaf,
-                              batch_capacity);
         float alpha             = 1.0f;
         float beta              = 0.0f;
         long long vector_stride = static_cast<long long>(vector_elements_per_leaf);
         long long gram_stride   = static_cast<long long>(gram_elements_per_leaf);
         auto cublas_handle      = raft::resource::get_cublas_handle(res);
         RAFT_CUBLAS_TRY(cublasSetPointerMode(cublas_handle, CUBLAS_POINTER_MODE_HOST));
-        optional_leaf_stage_profiler profiler(stream);
         for (size_t leaf_offset = 0; leaf_offset < leaves.size(); leaf_offset += batch_capacity) {
           size_t batch_size    = std::min(batch_capacity, leaves.size() - leaf_offset);
           int64_t gather_items = static_cast<int64_t>(batch_size * vector_elements_per_leaf);
           int gather_blocks =
             static_cast<int>(std::min<int64_t>((gather_items + 255) / 256, 1048576));
-          profiler.begin();
           gather_float_leaf_vectors_kernel<<<gather_blocks, 256, 0, stream>>>(
             dataset.data_handle(),
             dimension,
@@ -1136,13 +729,11 @@ auto build(raft::resources const& res,
             static_cast<int64_t>(batch_size),
             leaf_vectors.data());
           RAFT_CUDA_TRY(cudaGetLastError());
-          profiler.gather_ms += profiler.end();
-          profiler.begin();
           RAFT_CUBLAS_TRY(cublasGemmStridedBatchedEx(cublas_handle,
                                                      CUBLAS_OP_T,
                                                      CUBLAS_OP_N,
-                                                     k_max_cluster,
-                                                     k_max_cluster,
+                                                     k_cluster_size,
+                                                     k_cluster_size,
                                                      dimension,
                                                      &alpha,
                                                      leaf_vectors.data(),
@@ -1156,14 +747,12 @@ auto build(raft::resources const& res,
                                                      &beta,
                                                      gram.data(),
                                                      CUDA_R_32F,
-                                                     k_max_cluster,
+                                                     k_cluster_size,
                                                      gram_stride,
                                                      static_cast<int>(batch_size),
                                                      CUBLAS_COMPUTE_32F,
                                                      CUBLAS_GEMM_DEFAULT));
-          profiler.gemm_ms += profiler.end();
-          profiler.begin();
-          leaf_gram_f32_knn_kernel<<<static_cast<int>(batch_size), k_cluster_size, 0, stream>>>(
+          leaf_gram_knn_kernel<<<static_cast<int>(batch_size), k_cluster_size, 0, stream>>>(
             gram.data(),
             ids.data(),
             origins.data(),
@@ -1174,34 +763,25 @@ auto build(raft::resources const& res,
             graph.data_handle(),
             degrees.data());
           RAFT_CUDA_TRY(cudaGetLastError());
-          profiler.topk_ms += profiler.end();
         }
-        profiler.write("fp32-fp32");
         used_gemm = true;
       }
-#endif
     }
   } else if constexpr (std::is_same_v<T, uint8_t> || std::is_same_v<T, int8_t>) {
     constexpr int64_t max_safe_dimension = std::numeric_limits<int32_t>::max() / (255 * 255);
     int64_t input_dimension              = dataset.extent(1);
     if (input_dimension <= max_safe_dimension) {
       int64_t padded_dimension        = (input_dimension + 3) & ~int64_t{3};
-      size_t vector_elements_per_leaf = static_cast<size_t>(k_max_cluster) * padded_dimension;
-      size_t gram_elements_per_leaf   = static_cast<size_t>(k_max_cluster) * k_max_cluster;
+      size_t vector_elements_per_leaf = static_cast<size_t>(k_cluster_size) * padded_dimension;
+      size_t gram_elements_per_leaf   = static_cast<size_t>(k_cluster_size) * k_cluster_size;
       size_t vector_bytes_per_leaf    = vector_elements_per_leaf * sizeof(int8_t);
       size_t gram_bytes_per_leaf      = gram_elements_per_leaf * sizeof(int32_t);
       size_t bytes_per_leaf           = vector_bytes_per_leaf + gram_bytes_per_leaf;
-      if (bytes_per_leaf <= k_leaf_gemm_workspace_bytes) {
+      if (bytes_per_leaf <= params.leaf_gemm_workspace_bytes) {
         size_t batch_capacity = std::max<size_t>(
-          1, std::min<size_t>(leaves.size(), k_leaf_gemm_workspace_bytes / bytes_per_leaf));
+          1, std::min<size_t>(leaves.size(), params.leaf_gemm_workspace_bytes / bytes_per_leaf));
         rmm::device_uvector<int8_t> leaf_vectors(batch_capacity * vector_elements_per_leaf, stream);
         rmm::device_uvector<int32_t> gram(batch_capacity * gram_elements_per_leaf, stream);
-        maybe_write_workspace("int8-int32",
-                              input_dimension,
-                              leaves.size(),
-                              vector_bytes_per_leaf,
-                              gram_bytes_per_leaf,
-                              batch_capacity);
         int32_t alpha           = 1;
         int32_t beta            = 0;
         int dimension           = static_cast<int>(padded_dimension);
@@ -1228,8 +808,8 @@ auto build(raft::resources const& res,
           RAFT_CUBLAS_TRY(cublasGemmStridedBatchedEx(cublas_handle,
                                                      CUBLAS_OP_T,
                                                      CUBLAS_OP_N,
-                                                     k_max_cluster,
-                                                     k_max_cluster,
+                                                     k_cluster_size,
+                                                     k_cluster_size,
                                                      dimension,
                                                      &alpha,
                                                      leaf_vectors.data(),
@@ -1243,12 +823,12 @@ auto build(raft::resources const& res,
                                                      &beta,
                                                      gram.data(),
                                                      CUDA_R_32I,
-                                                     k_max_cluster,
+                                                     k_cluster_size,
                                                      gram_stride,
                                                      static_cast<int>(batch_size),
                                                      CUBLAS_COMPUTE_32I,
                                                      CUBLAS_GEMM_DEFAULT));
-          leaf_gram_i32_knn_kernel<<<static_cast<int>(batch_size), k_cluster_size, 0, stream>>>(
+          leaf_gram_knn_kernel<<<static_cast<int>(batch_size), k_cluster_size, 0, stream>>>(
             gram.data(),
             ids.data(),
             origins.data(),
@@ -1287,34 +867,26 @@ auto build(raft::resources const& res,
   return graph;
 }
 
-static __global__ void copy_partition_graph_kernel(uint32_t const* source,
-                                                   int64_t source_rows,
-                                                   int64_t source_degree,
-                                                   uint32_t* destination,
-                                                   int64_t destination_degree,
-                                                   int64_t base_degree,
-                                                   uint32_t offset)
+static __global__ void copy_partition_with_scaffold_kernel(uint32_t const* source,
+                                                           uint32_t const* scaffold,
+                                                           int64_t source_rows,
+                                                           int64_t source_degree,
+                                                           uint32_t* destination,
+                                                           int64_t destination_degree,
+                                                           int64_t base_degree,
+                                                           uint32_t offset)
 {
   int64_t row = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (row >= source_rows) { return; }
   int64_t source_base      = row * source_degree;
-  int64_t destination_base = (row + offset) * destination_degree;
+  int64_t global_row       = row + offset;
+  int64_t destination_base = global_row * destination_degree;
   for (int64_t j = 0; j < base_degree; ++j) {
     destination[destination_base + j] = source[source_base + (j % source_degree)] + offset;
   }
-}
-
-static __global__ void append_scaffold_kernel(uint32_t const* scaffold,
-                                              uint32_t* graph,
-                                              int64_t rows,
-                                              int64_t graph_degree,
-                                              int64_t base_degree)
-{
-  int64_t row = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (row >= rows) { return; }
 #pragma unroll
   for (int j = 0; j < k_degree; ++j) {
-    graph[row * graph_degree + base_degree + j] = scaffold[row * k_degree + j];
+    destination[destination_base + base_degree + j] = scaffold[global_row * k_degree + j];
   }
 }
 
@@ -1338,19 +910,17 @@ auto append_to_input_graphs(
     auto source = indices[part]->graph();
     RAFT_EXPECTS(source.extent(1) > 0, "Input CAGRA graphs must have nonzero degree");
     int blocks = static_cast<int>((source.extent(0) + 255) / 256);
-    copy_partition_graph_kernel<<<blocks, 256, 0, stream>>>(source.data_handle(),
-                                                            source.extent(0),
-                                                            source.extent(1),
-                                                            graph.data_handle(),
-                                                            graph_degree,
-                                                            base_degree,
-                                                            static_cast<uint32_t>(offsets[part]));
+    copy_partition_with_scaffold_kernel<<<blocks, 256, 0, stream>>>(
+      source.data_handle(),
+      scaffold.data_handle(),
+      source.extent(0),
+      source.extent(1),
+      graph.data_handle(),
+      graph_degree,
+      base_degree,
+      static_cast<uint32_t>(offsets[part]));
     RAFT_CUDA_TRY(cudaGetLastError());
   }
-  int blocks = static_cast<int>((scaffold.extent(0) + 255) / 256);
-  append_scaffold_kernel<<<blocks, 256, 0, stream>>>(
-    scaffold.data_handle(), graph.data_handle(), scaffold.extent(0), graph_degree, base_degree);
-  RAFT_CUDA_TRY(cudaGetLastError());
   raft::resource::sync_stream(res);
   return graph;
 }
