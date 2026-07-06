@@ -46,6 +46,12 @@ target_link_libraries(
 )
 
 add_executable(CAGRA_MERGE_API_BENCH src/cagra_merge_api_bench.cu)
+target_include_directories(
+  CAGRA_MERGE_API_BENCH
+  PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../cpp/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../cpp/src
+)
 set_target_properties(
   CAGRA_MERGE_API_BENCH PROPERTIES CXX_STANDARD 20 CUDA_STANDARD 20
 )

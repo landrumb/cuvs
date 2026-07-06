@@ -32,7 +32,7 @@
 
 namespace cuvs::neighbors::cagra::detail {
 
-template <class T, class IdxT>
+template <bool ApplyRowFilter = true, class T, class IdxT>
 index<T, IdxT> merge_rebuild(raft::resources const& handle,
                              const cagra::index_params& params,
                              std::vector<cuvs::neighbors::cagra::index<T, IdxT>*>& indices,
@@ -45,8 +45,10 @@ index<T, IdxT> merge_rebuild(raft::resources const& handle,
   std::size_t new_dataset_size = 0;
   int64_t stride               = -1;
 
-  RAFT_EXPECTS(row_filter.get_filter_type() != cuvs::neighbors::filtering::FilterType::Bitmap,
-               "Bitmap filter isn't supported inside cagra::merge");
+  if constexpr (ApplyRowFilter) {
+    RAFT_EXPECTS(row_filter.get_filter_type() != cuvs::neighbors::filtering::FilterType::Bitmap,
+                 "Bitmap filter isn't supported inside cagra::merge");
+  }
 
   for (cagra_index_t* index : indices) {
     RAFT_EXPECTS(index != nullptr,
@@ -94,67 +96,72 @@ index<T, IdxT> merge_rebuild(raft::resources const& handle,
 
     merge_dataset(updated_dataset.data_handle());
 
-    if (row_filter.get_filter_type() == cuvs::neighbors::filtering::FilterType::Bitset) {
-      auto actual_filter =
-        dynamic_cast<const cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>&>(
-          row_filter);
-      auto filtered_row_count = actual_filter.view().count(handle);
+    if constexpr (ApplyRowFilter) {
+      if (row_filter.get_filter_type() == cuvs::neighbors::filtering::FilterType::Bitset) {
+        auto actual_filter =
+          dynamic_cast<const cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>&>(
+            row_filter);
+        auto filtered_row_count = actual_filter.view().count(handle);
 
-      // Convert the filter to a CSR matrix (so that we can pass indices to raft::copy_rows)
-      auto indices_csr = raft::make_device_csr_matrix<uint32_t, int64_t, int64_t, int64_t>(
-        handle, 1, new_dataset_size);
-      indices_csr.initialize_sparsity(filtered_row_count);
+        // Convert the filter to a CSR matrix (so that we can pass indices to raft::copy_rows)
+        auto indices_csr = raft::make_device_csr_matrix<uint32_t, int64_t, int64_t, int64_t>(
+          handle, 1, new_dataset_size);
+        indices_csr.initialize_sparsity(filtered_row_count);
 
-      actual_filter.view().to_csr(handle, indices_csr);
+        actual_filter.view().to_csr(handle, indices_csr);
 
-      // Get the indices array from the csr matrix. Note that this returns a raft::span object
-      // and we need to pass as device_vector_view, which is a 1D mdspan (instead of a span)
-      // so we need to translate here (and adjust to be const)
-      auto indices      = indices_csr.structure_view().get_indices();
-      auto indices_view = raft::make_device_vector_view<const int64_t, int64_t>(
-        indices.data(), static_cast<int64_t>(indices.size()));
+        // Get the indices array from the csr matrix. Note that this returns a raft::span object
+        // and we need to pass as device_vector_view, which is a 1D mdspan (instead of a span)
+        // so we need to translate here (and adjust to be const)
+        auto indices      = indices_csr.structure_view().get_indices();
+        auto indices_view = raft::make_device_vector_view<const int64_t, int64_t>(
+          indices.data(), static_cast<int64_t>(indices.size()));
 
-      auto filtered_dataset = raft::make_device_matrix<T, int64_t>(handle, filtered_row_count, dim);
-      raft::matrix::copy_rows(handle,
-                              raft::make_const_mdspan(updated_dataset.view()),
-                              filtered_dataset.view(),
-                              indices_view);
+        auto filtered_dataset =
+          raft::make_device_matrix<T, int64_t>(handle, filtered_row_count, dim);
+        raft::matrix::copy_rows(handle,
+                                raft::make_const_mdspan(updated_dataset.view()),
+                                filtered_dataset.view(),
+                                indices_view);
 
-      auto merged_index =
-        cagra::build(handle, params, raft::make_const_mdspan(filtered_dataset.view()));
-      if (!merged_index.data().is_owning() && params.attach_dataset_on_build) {
-        using matrix_t           = decltype(updated_dataset);
-        using layout_t           = typename matrix_t::layout_type;
-        using container_policy_t = typename matrix_t::container_policy_type;
-        using owning_t           = owning_dataset<T, int64_t, layout_t, container_policy_t>;
-        auto out_layout          = raft::make_strided_layout(filtered_dataset.view().extents(),
-                                                    cuda::std::array<int64_t, 2>{stride, 1});
+        auto merged_index =
+          cagra::build(handle, params, raft::make_const_mdspan(filtered_dataset.view()));
+        if (!merged_index.data().is_owning() && params.attach_dataset_on_build) {
+          using matrix_t           = decltype(updated_dataset);
+          using layout_t           = typename matrix_t::layout_type;
+          using container_policy_t = typename matrix_t::container_policy_type;
+          using owning_t           = owning_dataset<T, int64_t, layout_t, container_policy_t>;
+          auto out_layout          = raft::make_strided_layout(filtered_dataset.view().extents(),
+                                                      cuda::std::array<int64_t, 2>{stride, 1});
 
-        merged_index.update_dataset(handle, owning_t{std::move(filtered_dataset), out_layout});
+          merged_index.update_dataset(handle, owning_t{std::move(filtered_dataset), out_layout});
+        }
+        RAFT_LOG_DEBUG("cagra merge: using device memory for merged dataset");
+        return merged_index;
       }
-      RAFT_LOG_DEBUG("cagra merge: using device memory for merged dataset");
-      return merged_index;
-    } else {
-      auto merged_index =
-        cagra::build(handle, params, raft::make_const_mdspan(updated_dataset.view()));
-      if (!merged_index.data().is_owning() && params.attach_dataset_on_build) {
-        using matrix_t           = decltype(updated_dataset);
-        using layout_t           = typename matrix_t::layout_type;
-        using container_policy_t = typename matrix_t::container_policy_type;
-        using owning_t           = owning_dataset<T, int64_t, layout_t, container_policy_t>;
-        auto out_layout          = raft::make_strided_layout(updated_dataset.view().extents(),
-                                                    cuda::std::array<int64_t, 2>{stride, 1});
-
-        merged_index.update_dataset(handle, owning_t{std::move(updated_dataset), out_layout});
-      }
-      RAFT_LOG_DEBUG("cagra merge: using device memory for merged dataset");
-      return merged_index;
     }
+
+    auto merged_index =
+      cagra::build(handle, params, raft::make_const_mdspan(updated_dataset.view()));
+    if (!merged_index.data().is_owning() && params.attach_dataset_on_build) {
+      using matrix_t           = decltype(updated_dataset);
+      using layout_t           = typename matrix_t::layout_type;
+      using container_policy_t = typename matrix_t::container_policy_type;
+      using owning_t           = owning_dataset<T, int64_t, layout_t, container_policy_t>;
+      auto out_layout          = raft::make_strided_layout(updated_dataset.view().extents(),
+                                                  cuda::std::array<int64_t, 2>{stride, 1});
+
+      merged_index.update_dataset(handle, owning_t{std::move(updated_dataset), out_layout});
+    }
+    RAFT_LOG_DEBUG("cagra merge: using device memory for merged dataset");
+    return merged_index;
   } catch (std::bad_alloc& e) {
     // We don't currently support the cpu memory fallback with filtered merge, since the
     // 'raft::matrix::copy_rows' only supports gpu memory
-    RAFT_EXPECTS(row_filter.get_filter_type() == cuvs::neighbors::filtering::FilterType::None,
-                 "Filtered merge isn't available on cpu memory");
+    if constexpr (ApplyRowFilter) {
+      RAFT_EXPECTS(row_filter.get_filter_type() == cuvs::neighbors::filtering::FilterType::None,
+                   "Filtered merge isn't available on cpu memory");
+    }
 
     RAFT_LOG_DEBUG("cagra::merge: using host memory for merged dataset");
 
@@ -181,7 +188,8 @@ index<T, IdxT> merge_rebuild(raft::resources const& handle,
 template <class T, class IdxT>
 index<T, IdxT> merge_with_k4_scaffold(raft::resources const& handle,
                                       const cagra::index_params& params,
-                                      std::vector<cuvs::neighbors::cagra::index<T, IdxT>*>& indices)
+                                      std::vector<cuvs::neighbors::cagra::index<T, IdxT>*>& indices,
+                                      merge_scaffold::build_params const& scaffold_params = {})
 {
   using cagra_index_t = cuvs::neighbors::cagra::index<T, IdxT>;
   using ds_idx_type   = typename cagra_index_t::dataset_index_type;
@@ -231,15 +239,48 @@ index<T, IdxT> merge_with_k4_scaffold(raft::resources const& handle,
   }
   raft::resource::sync_stream(handle);
 
-  auto scaffold =
-    merge_scaffold::build<T>(handle, raft::make_const_mdspan(updated_dataset.view()), offsets);
+  auto stream          = raft::resource::get_cuda_stream(handle);
+  bool measure_quality = scaffold_params.quality_stats_output != nullptr;
+  rmm::device_uvector<uint8_t> scaffold_degrees(measure_quality ? new_dataset_size : 0, stream);
+  auto scaffold     = merge_scaffold::build<T>(handle,
+                                           raft::make_const_mdspan(updated_dataset.view()),
+                                           offsets,
+                                           scaffold_params,
+                                           measure_quality ? scaffold_degrees.data() : nullptr);
   auto merged_graph = merge_scaffold::append_to_input_graphs<T, IdxT>(
     handle, indices, offsets, raft::make_const_mdspan(scaffold.view()));
 
   RAFT_EXPECTS(static_cast<int64_t>(params.graph_degree) <= merged_graph.extent(1),
-               "Requested output graph degree exceeds input graph degree plus the k=4 scaffold");
+               "Requested output graph degree exceeds input graph degree plus the scaffold");
   cagra::detail::graph::sort_knn_graph_device_inplace(
     handle, params.metric, raft::make_const_mdspan(updated_dataset.view()), merged_graph.view());
+
+  if (measure_quality) {
+    auto quality_start = std::chrono::steady_clock::now();
+    merge_scaffold::measure_preopt_quality(handle,
+                                           raft::make_const_mdspan(scaffold.view()),
+                                           scaffold_degrees.data(),
+                                           raft::make_const_mdspan(merged_graph.view()),
+                                           params.graph_degree,
+                                           scaffold_params.quality_sample_rows,
+                                           *scaffold_params.quality_stats_output);
+    auto quality_end = std::chrono::steady_clock::now();
+    scaffold_params.quality_stats_output->measurement_ms =
+      std::chrono::duration<double, std::milli>(quality_end - quality_start).count();
+  }
+  int64_t preopt_graph_degree_cap = scaffold_params.preopt_graph_degree_cap;
+  if (preopt_graph_degree_cap == merge_scaffold::k_cap_to_output_graph_degree) {
+    preopt_graph_degree_cap = params.graph_degree;
+  }
+  if (preopt_graph_degree_cap > 0) {
+    RAFT_EXPECTS(preopt_graph_degree_cap >= static_cast<int64_t>(params.graph_degree) &&
+                   preopt_graph_degree_cap <= merged_graph.extent(1),
+                 "Pre-optimize graph degree cap must be between output and candidate degree");
+    if (preopt_graph_degree_cap < merged_graph.extent(1)) {
+      merged_graph = merge_scaffold::cap_sorted_graph(
+        handle, raft::make_const_mdspan(merged_graph.view()), preopt_graph_degree_cap);
+    }
+  }
 
   auto optimized_graph = raft::make_device_matrix<uint32_t, int64_t>(
     handle, int64_t(new_dataset_size), int64_t(params.graph_degree));
@@ -276,7 +317,9 @@ index<T, IdxT> merge(raft::resources const& handle,
       }
     }
     graph_degree_supported =
-      params.graph_degree > 0 && params.graph_degree <= max_input_degree + merge_scaffold::k_degree;
+      params.graph_degree > 0 &&
+      params.graph_degree <=
+        max_input_degree + merge_scaffold::k_degree * merge_scaffold::k_default_repeats;
   }
 
   bool use_scaffold =

@@ -1,0 +1,81 @@
+scope,dataset,parts,scaffold_repeats,scaffold_neighbors_per_leaf,scaffold_seed,varying,samples,metric,metric_field,quality_direction,pearson,spearman
+repeat-sweep,OpenAI-2M,128,,4,1234,scaffold_repeats,6,all-edge mean rank,preopt_candidate_rank_mean,-1,-0.708857085,-1.000000000
+repeat-sweep,OpenAI-2M,128,,4,1234,scaffold_repeats,6,best-edge mean rank,preopt_best_candidate_rank_mean,-1,0.970320036,1.000000000
+repeat-sweep,OpenAI-2M,128,,4,1234,scaffold_repeats,6,best-four mean rank,preopt_top4_candidate_rank_mean,-1,0.969978425,0.942857143
+repeat-sweep,OpenAI-2M,128,,4,1234,scaffold_repeats,6,fraction rank <= 16,preopt_fraction_rank_le_16,1,-0.870500994,-1.000000000
+repeat-sweep,OpenAI-2M,128,,4,1234,scaffold_repeats,6,fraction rank <= 32,preopt_fraction_rank_le_32,1,-0.754291063,-1.000000000
+repeat-sweep,OpenAI-2M,128,,4,1234,scaffold_repeats,6,fraction rank <= 64,preopt_fraction_rank_le_64,1,-0.622384051,-1.000000000
+repeat-sweep,OpenAI-2M,128,,4,1234,scaffold_repeats,6,count rank <= 16,preopt_count_rank_le_16,1,0.980188096,0.828571429
+repeat-sweep,OpenAI-2M,128,,4,1234,scaffold_repeats,6,count rank <= 32,preopt_count_rank_le_32,1,0.944663242,0.942857143
+repeat-sweep,OpenAI-2M,128,,4,1234,scaffold_repeats,6,count rank <= 64,preopt_count_rank_le_64,1,0.869436739,1.000000000
+repeat-sweep,OpenAI-2M,128,,4,1234,scaffold_repeats,6,unique scaffold degree,unique_scaffold_degree_mean,1,0.730860596,1.000000000
+repeat-sweep,Wiki-1M,128,,4,1234,scaffold_repeats,6,all-edge mean rank,preopt_candidate_rank_mean,-1,-0.618444253,-1.000000000
+repeat-sweep,Wiki-1M,128,,4,1234,scaffold_repeats,6,best-edge mean rank,preopt_best_candidate_rank_mean,-1,0.999543555,1.000000000
+repeat-sweep,Wiki-1M,128,,4,1234,scaffold_repeats,6,best-four mean rank,preopt_top4_candidate_rank_mean,-1,0.995155391,0.828571429
+repeat-sweep,Wiki-1M,128,,4,1234,scaffold_repeats,6,fraction rank <= 16,preopt_fraction_rank_le_16,1,-0.813022676,-1.000000000
+repeat-sweep,Wiki-1M,128,,4,1234,scaffold_repeats,6,fraction rank <= 32,preopt_fraction_rank_le_32,1,-0.682824889,-1.000000000
+repeat-sweep,Wiki-1M,128,,4,1234,scaffold_repeats,6,fraction rank <= 64,preopt_fraction_rank_le_64,1,-0.531100036,-1.000000000
+repeat-sweep,Wiki-1M,128,,4,1234,scaffold_repeats,6,count rank <= 16,preopt_count_rank_le_16,1,0.954738182,0.600000000
+repeat-sweep,Wiki-1M,128,,4,1234,scaffold_repeats,6,count rank <= 32,preopt_count_rank_le_32,1,0.917396984,0.828571429
+repeat-sweep,Wiki-1M,128,,4,1234,scaffold_repeats,6,count rank <= 64,preopt_count_rank_le_64,1,0.825711609,0.942857143
+repeat-sweep,Wiki-1M,128,,4,1234,scaffold_repeats,6,unique scaffold degree,unique_scaffold_degree_mean,1,0.662904083,1.000000000
+repeat-sweep,YFCC-10M,128,,4,1234,scaffold_repeats,6,all-edge mean rank,preopt_candidate_rank_mean,-1,-0.669606729,-1.000000000
+repeat-sweep,YFCC-10M,128,,4,1234,scaffold_repeats,6,best-edge mean rank,preopt_best_candidate_rank_mean,-1,0.948367951,1.000000000
+repeat-sweep,YFCC-10M,128,,4,1234,scaffold_repeats,6,best-four mean rank,preopt_top4_candidate_rank_mean,-1,0.923539999,0.485714286
+repeat-sweep,YFCC-10M,128,,4,1234,scaffold_repeats,6,fraction rank <= 16,preopt_fraction_rank_le_16,1,-0.825106775,-1.000000000
+repeat-sweep,YFCC-10M,128,,4,1234,scaffold_repeats,6,fraction rank <= 32,preopt_fraction_rank_le_32,1,-0.682902952,-1.000000000
+repeat-sweep,YFCC-10M,128,,4,1234,scaffold_repeats,6,fraction rank <= 64,preopt_fraction_rank_le_64,1,-0.530828506,-1.000000000
+repeat-sweep,YFCC-10M,128,,4,1234,scaffold_repeats,6,count rank <= 16,preopt_count_rank_le_16,1,0.969926374,0.771428571
+repeat-sweep,YFCC-10M,128,,4,1234,scaffold_repeats,6,count rank <= 32,preopt_count_rank_le_32,1,0.928069734,0.942857143
+repeat-sweep,YFCC-10M,128,,4,1234,scaffold_repeats,6,count rank <= 64,preopt_count_rank_le_64,1,0.836831026,1.000000000
+repeat-sweep,YFCC-10M,128,,4,1234,scaffold_repeats,6,unique scaffold degree,unique_scaffold_degree_mean,1,0.697797082,1.000000000
+seed-sweep,OpenAI-2M,128,2,4,,scaffold_seed,33,all-edge mean rank,preopt_candidate_rank_mean,-1,0.805670778,0.675467914
+seed-sweep,OpenAI-2M,128,2,4,,scaffold_seed,33,best-edge mean rank,preopt_best_candidate_rank_mean,-1,0.738203822,0.584224599
+seed-sweep,OpenAI-2M,128,2,4,,scaffold_seed,33,best-four mean rank,preopt_top4_candidate_rank_mean,-1,0.784327297,0.674465241
+seed-sweep,OpenAI-2M,128,2,4,,scaffold_seed,33,fraction rank <= 16,preopt_fraction_rank_le_16,1,0.792599615,0.685494652
+seed-sweep,OpenAI-2M,128,2,4,,scaffold_seed,33,fraction rank <= 32,preopt_fraction_rank_le_32,1,0.803277914,0.664104278
+seed-sweep,OpenAI-2M,128,2,4,,scaffold_seed,33,fraction rank <= 64,preopt_fraction_rank_le_64,1,0.748137135,0.612633690
+seed-sweep,OpenAI-2M,128,2,4,,scaffold_seed,33,count rank <= 16,preopt_count_rank_le_16,1,0.788230573,0.667446524
+seed-sweep,OpenAI-2M,128,2,4,,scaffold_seed,33,count rank <= 32,preopt_count_rank_le_32,1,0.794715818,0.638368984
+seed-sweep,OpenAI-2M,128,2,4,,scaffold_seed,33,count rank <= 64,preopt_count_rank_le_64,1,0.601380377,0.424465241
+seed-sweep,OpenAI-2M,128,2,4,,scaffold_seed,33,unique scaffold degree,unique_scaffold_degree_mean,1,-0.734233070,-0.700769013
+seed-sweep,Wiki-1M,128,2,4,,scaffold_seed,33,all-edge mean rank,preopt_candidate_rank_mean,-1,0.514416533,0.535806804
+seed-sweep,Wiki-1M,128,2,4,,scaffold_seed,33,best-edge mean rank,preopt_best_candidate_rank_mean,-1,0.469083178,0.458594470
+seed-sweep,Wiki-1M,128,2,4,,scaffold_seed,33,best-four mean rank,preopt_top4_candidate_rank_mean,-1,0.428065606,0.432857025
+seed-sweep,Wiki-1M,128,2,4,,scaffold_seed,33,fraction rank <= 16,preopt_fraction_rank_le_16,1,0.590828463,0.590457092
+seed-sweep,Wiki-1M,128,2,4,,scaffold_seed,33,fraction rank <= 32,preopt_fraction_rank_le_32,1,0.414953688,0.339433443
+seed-sweep,Wiki-1M,128,2,4,,scaffold_seed,33,fraction rank <= 64,preopt_fraction_rank_le_64,1,0.268155885,0.275591210
+seed-sweep,Wiki-1M,128,2,4,,scaffold_seed,33,count rank <= 16,preopt_count_rank_le_16,1,0.593022251,0.601153173
+seed-sweep,Wiki-1M,128,2,4,,scaffold_seed,33,count rank <= 32,preopt_count_rank_le_32,1,0.364726989,0.255368932
+seed-sweep,Wiki-1M,128,2,4,,scaffold_seed,33,count rank <= 64,preopt_count_rank_le_64,1,-0.093919408,-0.081223365
+seed-sweep,Wiki-1M,128,2,4,,scaffold_seed,33,unique scaffold degree,unique_scaffold_degree_mean,1,-0.420093492,-0.421158186
+seed-sweep,YFCC-10M,128,2,4,,scaffold_seed,33,all-edge mean rank,preopt_candidate_rank_mean,-1,0.886796735,0.898395722
+seed-sweep,YFCC-10M,128,2,4,,scaffold_seed,33,best-edge mean rank,preopt_best_candidate_rank_mean,-1,0.847090307,0.795120321
+seed-sweep,YFCC-10M,128,2,4,,scaffold_seed,33,best-four mean rank,preopt_top4_candidate_rank_mean,-1,0.886377919,0.853275401
+seed-sweep,YFCC-10M,128,2,4,,scaffold_seed,33,fraction rank <= 16,preopt_fraction_rank_le_16,1,0.911699036,0.909759358
+seed-sweep,YFCC-10M,128,2,4,,scaffold_seed,33,fraction rank <= 32,preopt_fraction_rank_le_32,1,0.859311152,0.876671123
+seed-sweep,YFCC-10M,128,2,4,,scaffold_seed,33,fraction rank <= 64,preopt_fraction_rank_le_64,1,0.611257389,0.533756684
+seed-sweep,YFCC-10M,128,2,4,,scaffold_seed,33,count rank <= 16,preopt_count_rank_le_16,1,0.914994748,0.907754011
+seed-sweep,YFCC-10M,128,2,4,,scaffold_seed,33,count rank <= 32,preopt_count_rank_le_32,1,0.838888796,0.848596257
+seed-sweep,YFCC-10M,128,2,4,,scaffold_seed,33,count rank <= 64,preopt_count_rank_le_64,1,0.329711183,0.288435829
+seed-sweep,YFCC-10M,128,2,4,,scaffold_seed,33,unique scaffold degree,unique_scaffold_degree_mean,1,-0.586290996,-0.556818182
+repeat-sweep-mean,mean,,,,,scaffold_repeats,18,all-edge mean rank,preopt_candidate_rank_mean,-1,-0.665636022,-1.000000000
+repeat-sweep-mean,mean,,,,,scaffold_repeats,18,best-edge mean rank,preopt_best_candidate_rank_mean,-1,0.972743847,1.000000000
+repeat-sweep-mean,mean,,,,,scaffold_repeats,18,best-four mean rank,preopt_top4_candidate_rank_mean,-1,0.962891272,0.752380952
+repeat-sweep-mean,mean,,,,,scaffold_repeats,18,count rank <= 16,preopt_count_rank_le_16,1,0.968284217,0.733333333
+repeat-sweep-mean,mean,,,,,scaffold_repeats,18,count rank <= 32,preopt_count_rank_le_32,1,0.930043320,0.904761905
+repeat-sweep-mean,mean,,,,,scaffold_repeats,18,count rank <= 64,preopt_count_rank_le_64,1,0.843993125,0.980952381
+repeat-sweep-mean,mean,,,,,scaffold_repeats,18,fraction rank <= 16,preopt_fraction_rank_le_16,1,-0.836210148,-1.000000000
+repeat-sweep-mean,mean,,,,,scaffold_repeats,18,fraction rank <= 32,preopt_fraction_rank_le_32,1,-0.706672968,-1.000000000
+repeat-sweep-mean,mean,,,,,scaffold_repeats,18,fraction rank <= 64,preopt_fraction_rank_le_64,1,-0.561437531,-1.000000000
+repeat-sweep-mean,mean,,,,,scaffold_repeats,18,unique scaffold degree,unique_scaffold_degree_mean,1,0.697187254,1.000000000
+seed-sweep-mean,mean,,,,,scaffold_seed,99,all-edge mean rank,preopt_candidate_rank_mean,-1,0.735628015,0.703223480
+seed-sweep-mean,mean,,,,,scaffold_seed,99,best-edge mean rank,preopt_best_candidate_rank_mean,-1,0.684792436,0.612646463
+seed-sweep-mean,mean,,,,,scaffold_seed,99,best-four mean rank,preopt_top4_candidate_rank_mean,-1,0.699590274,0.653532556
+seed-sweep-mean,mean,,,,,scaffold_seed,99,count rank <= 16,preopt_count_rank_le_16,1,0.765415857,0.725451236
+seed-sweep-mean,mean,,,,,scaffold_seed,99,count rank <= 32,preopt_count_rank_le_32,1,0.666110534,0.580778058
+seed-sweep-mean,mean,,,,,scaffold_seed,99,count rank <= 64,preopt_count_rank_le_64,1,0.279057384,0.210559235
+seed-sweep-mean,mean,,,,,scaffold_seed,99,fraction rank <= 16,preopt_fraction_rank_le_16,1,0.765042372,0.728570368
+seed-sweep-mean,mean,,,,,scaffold_seed,99,fraction rank <= 32,preopt_fraction_rank_le_32,1,0.692514251,0.626736281
+seed-sweep-mean,mean,,,,,scaffold_seed,99,fraction rank <= 64,preopt_fraction_rank_le_64,1,0.542516803,0.473993861
+seed-sweep-mean,mean,,,,,scaffold_seed,99,unique scaffold degree,unique_scaffold_degree_mean,1,-0.580205853,-0.559581794

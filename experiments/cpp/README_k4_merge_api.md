@@ -5,13 +5,16 @@ merges. Unfiltered `L2Expanded` merges of at least two attached, uncompressed CA
 
 1. concatenate the input datasets on the device;
 2. preserve each input graph as a disconnected, offset-adjusted base graph;
-3. build one deterministic pivot tree (seed 1234) with leaf size 256;
-4. compute each leaf's cross-origin neighbors from a Gram matrix in bounded batches (FP32 GEMM
+3. build eight independently seeded deterministic pivot trees (seed 1234 followed by
+   `splitmix64`-derived seeds) with leaf size 256;
+4. compute each tree's four leaf-local cross-origin neighbors in bounded batches (FP32 GEMM
    for float data and native int8/int32 GEMM for byte data);
-5. append those four scaffold neighbors to the base graph;
-6. distance-sort the dense graph in place;
-7. run the existing CAGRA graph optimizer to the requested `index_params.graph_degree`; and
-8. return an index that owns both its aligned dataset and device graph.
+5. deduplicate and union the candidates into an up-to-degree-32 scaffold;
+6. append that scaffold to the base graph;
+7. distance-sort the dense graph in place;
+8. by default retain the first `index_params.graph_degree` unique candidates; then
+9. run the existing CAGRA graph optimizer to that requested degree; and
+10. return an index that owns both its aligned dataset and device graph.
 
 The scaffold uses stable binary scatter rather than a global radix sort at every pivot level.
 Per-chunk counts preserve the checkpoint's active-first, stable ordering while transferring only
@@ -21,6 +24,12 @@ at most 2 GiB of temporary batches. Float32 uses standard-precision FP32 Gram ma
 centered by 128 into int8 (which preserves L2 distance) and multiplied with exact int32 accumulation;
 signed int8 uses the same path without centering. There is no float conversion of the byte dataset.
 Float16 and integer dimensions unsafe for int32 accumulation retain the direct-L2 leaf kernel.
+
+Every repeat reruns both pivot-tree partitioning and leaf nearest-neighbor assignment. Repeat lists
+are unioned before the existing distance sort and optimizer, and duplicate candidates do not consume
+extra scaffold slots. The production default is k4 with eight repeats. After the full combined list
+is sorted, the default unique-candidate cap dynamically matches the requested output graph degree;
+an explicit cap of zero disables pruning. Both repeat count and cap remain benchmarkable knobs.
 
 The optimizer writes directly to its final device matrix. The returned index takes ownership of
 that matrix, avoiding optimizer host writeback and the subsequent host-to-device graph copy. The
@@ -47,14 +56,18 @@ unchanged.
 - All nine leaf-64 dataset/fan-in benchmarks, all 30 legacy leaf-size sweep runs, the 12 new
   production leaf-64/256 runs, and the 8-way distance/origin trials completed with the complete
   query and ground-truth sets.
+- The repeat-count study completed two full-query 8-way sweeps at every repeat count from 1 through
+  8 on Wiki-1M, OpenAI-2M, and YFCC-10M.
 
 ## Benchmark boundary
 
-`CAGRA_MERGE_API_BENCH` invokes the public `cagra::merge()` call. Input partition indexes are
-constructed contiguously in-process so concatenation preserves source IDs. Their construction is
-oracular and excluded, as are dataset/query reads and query transfer. `merge_api_e2e_ms` includes
-merged-dataset allocation/copy, scaffold construction, base-graph append, distance sort, CAGRA
-optimization, and final index attachment.
+`CAGRA_MERGE_API_BENCH` includes the worktree's internal merge implementation so every measured
+point uses the selected local repeat count rather than a packaged cuVS merge symbol. The
+`--scaffold-repeats 1-8` control selects one count and `--scaffold-repeat-sweep` runs all eight.
+Input partition indexes are constructed contiguously in-process so concatenation preserves source
+IDs. Their construction is oracular and excluded, as are dataset/query reads and query transfer.
+`merge_api_e2e_ms` includes merged-dataset allocation/copy, scaffold construction, base-graph
+append, distance sort, CAGRA optimization, and final index attachment.
 
 Search uses CAGRA with k=12, `itopk_size=160`, one warmup, and the median of three repetitions.
 Every dataset uses its complete query set and provided ground truth. Measurements were made on an
@@ -283,6 +296,179 @@ nearest-pivot policy dominates it in this end-to-end test. Raw runs are in
 and baseline deltas in
 [pivot_tree_variants_8way_summary.csv](merge_api_results/pivot_tree_variants_8way_summary.csv).
 
+### Independent scaffold repeats
+
+HCNNG builds multiple independently randomized cluster trees and unions the edges they emit.
+Fastener follows the same pattern: repeat 0 uses seed 1234, later repeats derive deterministic
+`splitmix64` seeds, and every repeat reruns the complete pivot-tree partition and leaf nearest-
+neighbor assignment. Each pass emits four cross-origin candidates per row. The lists are deduplicated
+into an up-to-degree-`4r` scaffold for `r` repeats, padded only after the union, then appended before
+the existing distance sort and degree-64 optimizer.
+
+The production default is now eight repeats with four neighbors per tree.
+`CAGRA_MERGE_API_BENCH --scaffold-repeats 1-32` selects an explicit count, while
+`--scaffold-repeat-sweep` evaluates counts 1 through 8 in one process. The default ranked unique cap
+matches the requested output graph degree; `--scaffold-candidate-cap 0` restores the uncapped path.
+
+The 8-way sweep used every query and ground-truth row and two independent processes per dataset. Each
+process first performed an unmeasured two-repeat warmup, then measured repeat counts 1 through 8. The
+figure and table report two-run means; the figure's error bars span the two observed values.
+
+| dataset | scaffold repeats | merge build | Recall@12 |
+| --- | ---: | ---: | ---: |
+| Wiki-1M | 1 | 0.314 s | 0.976771 |
+| Wiki-1M | 2 (former uncapped default) | 0.436 s (+38.91%) | 0.984925 (+0.008154) |
+| Wiki-1M | 8 (current repeat count; uncapped here) | 1.152 s (+266.79%) | 0.991942 (+0.015171) |
+| OpenAI-2M | 1 | 1.486 s | 0.920134 |
+| OpenAI-2M | 2 (former uncapped default) | 1.968 s (+32.41%) | 0.935942 (+0.015808) |
+| OpenAI-2M | 8 (current repeat count; uncapped here) | 4.796 s (+222.72%) | 0.953692 (+0.033558) |
+| YFCC-10M (uint8) | 1 | 1.576 s | 0.955596 |
+| YFCC-10M (uint8) | 2 (former uncapped default) | 1.844 s (+17.04%) | 0.965587 (+0.009991) |
+| YFCC-10M (uint8) | 8 (current repeat count; uncapped here) | 3.542 s (+124.74%) | 0.978823 (+0.023227) |
+
+![Build time and recall for 1-8 scaffold repeats](merge_api_results/plots/k4_scaffold_repeat_sweep_8way.png)
+
+Merge time grows nearly linearly with repeat count. The second repeat gives the largest marginal
+recall gain on every dataset: +0.008154 on Wiki, +0.015808 on OpenAI, and +0.009991 on YFCC. Repeat 2
+therefore captures 43%-54% of the total repeat-1-to-8 recall gain, while later repeats have sharply
+diminishing gains. At repeat 8, merge build is 2.25x-3.67x the one-repeat time. This uncapped study
+initially motivated the former two-repeat default. The later ranked-cap sweep supports the current
+k4-r8 configuration by avoiding optimization over the long candidate tail.
+
+Exact points, per-run values, and deltas are in
+[scaffold_repeat_sweep_8way.csv](merge_api_results/scaffold_repeat_sweep_8way.csv) and
+[scaffold_repeat_sweep_8way_summary.csv](merge_api_results/scaffold_repeat_sweep_8way_summary.csv).
+The figure is reproducible with [plot_k4_scaffold_repeats.py](plot_k4_scaffold_repeats.py).
+
+The earlier focused 1-vs-2 trial is retained in
+[scaffold_repeats_8way.csv](merge_api_results/scaffold_repeats_8way.csv) and
+[scaffold_repeats_8way_summary.csv](merge_api_results/scaffold_repeats_8way_summary.csv).
+
+### Scaffold quality and ranked-head pruning
+
+A separate proxy study instruments the exact positions of scaffold edges after candidate sorting and
+before CAGRA optimize. At fixed work, the number of scaffold edges in the first 16 positions is a
+strong predictor of final recall. The study uses that signal to test leaf width, mixed tree widths,
+and ranked unique candidate caps.
+
+The main result is cap64: at 8- and 128-way fan-in, k4-r2-cap64 is both faster and higher-recall than
+the then-current uncapped k4-r2 path on all three datasets in two independent trials. k8-r2-cap64 is
+a higher-recall Pareto option. Fastener now enables this ranked unique cap by default, dynamically
+using the requested output degree rather than hard-coding 64, together with k4-r8.
+A matched 128-way repeat sweep extends that result: unique cap64 is faster and higher-recall than
+the corresponding uncapped graph in all 33 k4-r1..r32 and k8-r1..r16 configurations, and the capped
+repeat curves are included in the scaffold recall/merge-time frontier.
+Methods, replicated tables, plots, raw CSVs, and reproduction commands are in
+[README_scaffold_quality.md](README_scaffold_quality.md).
+
+![Ranked unique candidate-cap sweep](merge_api_results/plots/scaffold_cap_width_tradeoff.png)
+
+### Fan-in scaling against the binary tree cross-query merge
+
+Fastener with 2, 8, 16, and 32 scaffold repeats and the historical native balanced-compaction merge
+were run at 2, 4, 8, 16, 32, 64, and 128 input graphs. The baseline is a radix-2 tournament. At
+every pairwise merge it runs a light `k=8` cross-query for all rows, selects the lowest-ratio 50% of
+rows using nearest-cross / farthest-within distance, gives those boundary rows a full `k=64`
+cross-query, distance-sorts and deduplicates the within/cross candidates, forms a degree-128
+overgraph, and runs CAGRA optimization back to degree 64. The reported baseline build time covers
+the complete tournament; each Fastener variant performs one direct k-way merge.
+
+Each dataset/fan-in/method combination ran in a fresh process, so every prior leaf graph and
+intermediate tournament graph was released before the next case. No serialized subgraph artifacts
+were created. Oracular contiguous leaf-index construction is recorded in the raw CSV but excluded
+from merge build time. Recall and QPS use every query and ground-truth row, with search time taken as
+the median of three post-warmup full-query passes. These are single merge runs on an H100 PCIe.
+
+Each method cell below is `merge seconds / Recall@12`. Query throughput is shown in the figure and
+recorded in the CSVs.
+
+| dataset | fan-in | Fastener, 2 repeats | Fastener, 8 repeats | Fastener, 16 repeats | Fastener, 32 repeats | binary tree cross-query merge |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Wiki-1M | 2 | 0.445 / 0.992258 | 1.162 / 0.993708 | 2.239 / 0.993367 | 4.779 / 0.991517 | 9.620 / 0.995908 |
+| Wiki-1M | 128 | 0.398 / 0.929517 | 1.124 / 0.986242 | 2.205 / 0.992550 | 4.769 / 0.994042 | 64.997 / 0.992033 |
+| OpenAI-2M | 2 | 1.981 / 0.960137 | 4.764 / 0.961217 | 8.821 / 0.960746 | 18.497 / 0.957275 | 50.569 / 0.971254 |
+| OpenAI-2M | 128 | 1.714 / 0.796325 | 4.544 / 0.923763 | 8.599 / 0.948258 | 18.242 / 0.960129 | 337.160 / 0.965658 |
+| YFCC-10M (uint8) | 2 | 1.866 / 0.985442 | 3.550 / 0.986589 | 6.989 / 0.987155 | 18.170 / 0.986254 | 28.987 / 0.991297 |
+| YFCC-10M (uint8) | 128 | 1.747 / 0.833433 | 3.447 / 0.959641 | 7.008 / 0.978945 | 18.136 / 0.986153 | 201.586 / 0.988459 |
+
+![Fastener and cross-query scaling versus subgraph count](merge_api_results/plots/fastener_fanin_2_128.png)
+
+The merge-time panels above use a linear y axis. A companion rendering of the same measurements and
+rebuild references uses a logarithmic merge-time axis:
+
+![Fastener and cross-query scaling with logarithmic merge time](merge_api_results/plots/fastener_fanin_2_128_log.png)
+
+All four Fastener variants are effectively fan-in invariant. Across the seven fan-ins, merge-time
+ranges for 2/8/16/32 repeats are 0.398-0.447 / 1.124-1.164 / 2.205-2.239 / 4.769-4.790 s on Wiki,
+1.714-1.981 / 4.544-4.778 / 8.599-8.842 / 18.242-18.508 s on OpenAI, and
+1.747-1.866 / 3.447-3.561 / 6.972-7.053 / 18.055-18.221 s on YFCC. The binary baseline instead
+adds approximately one full-dataset cross-query/compaction pass per tree level, growing from 9.620
+to 64.997 s on Wiki, 50.569 to 337.160 s on OpenAI, and 28.987 to 201.586 s on YFCC.
+
+The dashed horizontal lines in every panel are direct, in-memory physical-rebuild means over the
+2/4/8-way controls. Merge means are 3.624 s for Wiki, 12.685 s for OpenAI, and 23.685 s for YFCC;
+Recall@12 means are 0.992236, 0.967943, and 0.988694; throughput means are 71.202, 34.312, and
+350.600 kQPS. Sixteen-repeat Fastener stays below rebuild on every merge-time point.
+Thirty-two repeats cross the rebuild
+reference on Wiki and OpenAI but stay below it on YFCC. Even at 32 repeats Fastener remains
+1.60x-18.48x faster than the binary tree cross-query merge over all 21 matched points; 16 repeats
+remain 4.15x-39.21x faster.
+
+Extra repeats directly address high-fan-in quality loss, but their benefit is not monotonic at low
+fan-in. At 128-way, 16 repeats improve Recall@12 over two repeats by
+0.063033/0.151933/0.145512 on Wiki/OpenAI/YFCC, and 32 repeats improve it by
+0.064525/0.163804/0.152720. The 32-repeat binary-baseline recall deltas at 128-way are +0.002009,
+-0.005529, and -0.002306, respectively: it slightly exceeds the binary recall on Wiki and nearly
+matches it on the other two datasets. At 2-way, however, 32 repeats are slightly worse than 16 on
+all three datasets, illustrating the diminishing and noisy returns from widening the candidate
+union beyond 16 passes.
+
+All 105 raw method rows are in
+[fanin_2_128_raw.csv](merge_api_results/fanin_2_128_raw.csv), matched comparisons and derived deltas
+are in [fanin_2_128_summary.csv](merge_api_results/fanin_2_128_summary.csv), and the run and figure
+are reproducible with [run_fanin_2_128.sh](run_fanin_2_128.sh) and
+[plot_fanin_2_128.py](plot_fanin_2_128.py).
+
+### Deserialization-inclusive merge time
+
+Caller-visible merge latency was measured from serialized partition indexes to a ready merged index.
+For each dataset and fan-in, the oracular partition indexes were serialized once, released, and then
+loaded afresh for each method. One warmup preceded two timed runs, with method order alternated. The
+serialized files were page-cache-warm; deserialization still includes CAGRA parsing, allocation, and
+host-to-device transfer. Input-index construction and staging serialization are recorded in the raw
+CSV but excluded from the end-to-end boundary.
+
+The timer starts before index-object setup, includes all partition `cagra::deserialize()` calls and a
+stream synchronization, then includes the merge implementation and another synchronization. It stops
+when the merged index is ready. The rebuild control is the cuVS 26.06 public physical merge, before
+the scaffold implementation, so it reconstructs a fresh CAGRA graph. Values below are two-run means.
+Other caller overhead (vector setup and pointer assembly) is only 0.009-0.028 ms in every row, so total
+overhead rounds to the deserialization value shown.
+
+| dataset | fan-in | Fastener deserialize | Fastener merge API | Fastener all-in | rebuild deserialize | rebuild merge API | rebuild all-in | all-in speedup |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Wiki-1M | 2 | 1.911 s | 0.440 s | 2.350 s | 1.884 s | 5.411 s | 7.295 s | 3.10x |
+| Wiki-1M | 4 | 1.931 s | 0.438 s | 2.369 s | 1.935 s | 5.433 s | 7.368 s | 3.11x |
+| Wiki-1M | 8 | 1.786 s | 0.431 s | 2.217 s | 1.795 s | 5.439 s | 7.233 s | 3.26x |
+| OpenAI-2M | 2 | 7.968 s | 1.975 s | 9.943 s | 7.980 s | 15.438 s | 23.418 s | 2.36x |
+| OpenAI-2M | 4 | 7.884 s | 1.968 s | 9.852 s | 7.901 s | 15.453 s | 23.354 s | 2.37x |
+| OpenAI-2M | 8 | 7.879 s | 1.955 s | 9.834 s | 7.859 s | 15.527 s | 23.386 s | 2.38x |
+| YFCC-10M (uint8) | 2 | 2.672 s | 1.856 s | 4.529 s | 2.667 s | 22.900 s | 25.567 s | 5.65x |
+| YFCC-10M (uint8) | 4 | 2.683 s | 1.851 s | 4.534 s | 2.649 s | 22.935 s | 25.584 s | 5.64x |
+| YFCC-10M (uint8) | 8 | 2.711 s | 1.846 s | 4.557 s | 2.730 s | 22.900 s | 25.629 s | 5.62x |
+
+Including deserialization reduces the apparent speedup because both methods pay essentially the same
+load cost, but Fastener remains 2.36x-5.65x faster end to end. Deserialization accounts for 80%-82% of
+Fastener time on the two float datasets and about 59% on YFCC; rebuild remains dominated by the merge
+API itself. Fan-in has little effect because the total serialized dataset and graph volume is nearly
+constant.
+
+Per-run measurements are in
+[deserialization_merge_breakdown.csv](merge_api_results/deserialization_merge_breakdown.csv), paired
+means and derived speedups are in
+[deserialization_merge_breakdown_summary.csv](merge_api_results/deserialization_merge_breakdown_summary.csv),
+and the summary is reproducible with
+[summarize_k4_deserialization.py](summarize_k4_deserialization.py).
 ## Leaf-distance matrix study at 8-way fan-in
 
 The leaf-128 kernel previously evaluated every directed candidate independently, so each

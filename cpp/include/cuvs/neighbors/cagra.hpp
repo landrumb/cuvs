@@ -2459,9 +2459,10 @@ void serialize_to_hnswlib(
  * attempting a logical merge here will throw an error.
  *
  * @note: Unfiltered L2 merges of two or more attached, uncompressed indices reuse the input graphs
- * by appending a degree-4 cross-input scaffold, distance-sorting the combined graph, and optimizing
- * it to the requested output graph degree. Unsupported configurations retain the rebuild
- * implementation.
+ * by deduplicating eight independently seeded degree-4 cross-input scaffolds into an
+ * up-to-degree-32 union, distance-sorting the combined graph, retaining the nearest unique
+ * candidates up to the requested output graph degree, and optimizing it to that degree. Unsupported
+ * configurations retain the rebuild implementation.
  *
  * Usage example:
  * @code{.cpp}
