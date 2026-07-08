@@ -1,0 +1,11 @@
+configuration,run,dataset,parts,rows,dim,dtype,active_device_dataset_copies,logical_active_device_dataset_gib,pageable_host_staging_gib,pinned_host_staging_gib,merge_ms,end_to_end_ms,rebuild_merge_ms,rebuild_end_to_end_ms,decision
+legacy_direct_device_concat,1,Wiki-1M,8,1000000,768,float32,2,5.722045898,0,0,1046.759056,2749.014059,5437.472300,7152.581895,baseline
+legacy_direct_device_concat,2,Wiki-1M,8,1000000,768,float32,2,5.722045898,0,0,1047.905844,2743.987058,5415.110700,7158.901550,baseline
+pageable_host_staging,1,Wiki-1M,8,1000000,768,float32,1,2.861022949,2.861022949,0,2698.889582,4411.394584,5426.543416,7139.266660,rejected_removed
+pageable_host_staging,2,Wiki-1M,8,1000000,768,float32,1,2.861022949,2.861022949,0,2663.737292,4347.784684,5466.039572,7158.894577,rejected_removed
+registered_host_staging,1,Wiki-1M,8,1000000,768,float32,1,2.861022949,0,2.861022949,2621.610742,4312.395415,5420.274704,7102.844806,rejected_full_host_pinning
+registered_host_staging,2,Wiki-1M,8,1000000,768,float32,1,2.861022949,0,2.861022949,2621.911543,4342.439922,5465.946028,7200.152452,rejected_full_host_pinning
+pageable_plus_pinned_shuttle,1,Wiki-1M,8,1000000,768,float32,1,2.861022949,2.861022949,0.25,3278.577466,4901.901240,3740.012576,5437.055568,rejected_slower
+pageable_plus_pinned_shuttle,2,Wiki-1M,8,1000000,768,float32,1,2.861022949,2.861022949,0.25,3298.307589,4929.665973,3580.803826,5214.661346,rejected_slower
+incremental_cuda_vmm,1,Wiki-1M,8,1000000,768,float32,1.1256,3.220397949,0,0,1046.895103,2681.259207,5387.375364,7022.678593,accepted
+incremental_cuda_vmm,2,Wiki-1M,8,1000000,768,float32,1.1256,3.220397949,0,0,1048.468993,2701.757372,3726.426820,5371.357067,accepted

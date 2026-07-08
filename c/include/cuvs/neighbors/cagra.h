@@ -855,6 +855,14 @@ CUVS_EXPORT cuvsError_t cuvsCagraIndexFromArgs(cuvsResources_t res,
  *
  * The resulting output index will have the same data type as the input indices.
  *
+ * For eligible unfiltered L2 graph-reuse merges whose inputs own their attached datasets, the
+ * implementation consumes the inputs while populating one contiguous allocation. Compatible CUDA
+ * virtual-memory configurations copy and release one input at a time. If VMM is unavailable,
+ * incompatible with the active RMM resource, or cannot allocate physical memory, merge uses the
+ * prior direct device-to-device concatenation and temporarily retains both dataset copies. The
+ * input handles remain valid as graph-only indices, but cannot be searched until a dataset is
+ * attached again; prior dataset views are invalidated. Non-owning inputs retain caller ownership.
+ *
  * Example:
  * @code{.c}
  * #include <cuvs/core/c_api.h>
@@ -884,7 +892,7 @@ CUVS_EXPORT cuvsError_t cuvsCagraIndexFromArgs(cuvsResources_t res,
  *
  * @param[in] res cuvsResources_t opaque C handle
  * @param[in] params cuvsCagraIndexParams_t parameters controlling merge behavior
- * @param[in] indices Array of input cuvsCagraIndex_t handles to merge
+ * @param[in,out] indices Array of input cuvsCagraIndex_t handles to merge
  * @param[in] num_indices Number of input indices
  * @param[in] filter Filter that can be used to filter out vectors from the merged index
  * @param[out] output_index Output handle that will store the merged index.

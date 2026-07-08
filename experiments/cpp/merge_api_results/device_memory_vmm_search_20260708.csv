@@ -1,0 +1,2 @@
+dataset,parts,implementation,dtype,rows,queries,graph_degree,intermediate_graph_degree,itopk,oracle_partition_build_ms_excluded,merge_api_e2e_ms,search_ms,recall,qps
+Wiki-1M-vmm-search,8,k4-scaffold-cap64,float32,1000000,10000,64,128,160,11365.952777,1052.513651,144.863475,0.992608,69030.513040

@@ -1262,6 +1262,7 @@ if(NOT BUILD_CPU_ONLY)
   target_link_libraries(
     cuvs_objs
     PRIVATE cuvs::cuvs_cpp_headers
+            CUDA::cuda_driver
             cuco::cuco
             nvidia::cutlass::cutlass
             ${CUVS_CTK_MATH_DEPENDENCIES}
@@ -1344,7 +1345,7 @@ if(NOT BUILD_CPU_ONLY)
              $<BUILD_LOCAL_INTERFACE:$<TARGET_NAME_IF_EXISTS:hnswlib::hnswlib>>
              $<$<BOOL:${CUVS_NVTX}>:CUDA::nvtx3>
       PRIVATE $<TARGET_NAME_IF_EXISTS:OpenMP::OpenMP_CXX> $<COMPILE_ONLY:nvidia::cutlass::cutlass>
-              $<COMPILE_ONLY:cuco::cuco> CUDA::nvJitLink CUDA::nvrtc
+              $<COMPILE_ONLY:cuco::cuco> CUDA::cuda_driver CUDA::nvJitLink CUDA::nvrtc
     )
 
     # ensure CUDA symbols aren't relocated to the middle of the debug build binaries
@@ -1396,6 +1397,7 @@ SECTIONS
              raft::raft
              cuvs::cuvs_cpp_headers
              ${CUVS_CTK_MATH_DEPENDENCIES}
+             CUDA::cuda_driver
              $<TARGET_NAME_IF_EXISTS:NCCL::NCCL> # needs to be public for DT_NEEDED
              $<BUILD_LOCAL_INTERFACE:$<TARGET_NAME_IF_EXISTS:hnswlib::hnswlib>> # header only
       PRIVATE $<TARGET_NAME_IF_EXISTS:OpenMP::OpenMP_CXX>

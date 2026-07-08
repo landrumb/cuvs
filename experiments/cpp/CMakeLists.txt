@@ -56,7 +56,8 @@ set_target_properties(
   CAGRA_MERGE_API_BENCH PROPERTIES CXX_STANDARD 20 CUDA_STANDARD 20
 )
 target_link_libraries(
-  CAGRA_MERGE_API_BENCH PRIVATE cuvs::cuvs $<TARGET_NAME_IF_EXISTS:conda_env>
+  CAGRA_MERGE_API_BENCH
+  PRIVATE cuvs::cuvs CUDA::cuda_driver $<TARGET_NAME_IF_EXISTS:conda_env>
 )
 
 add_executable(CAGRA_BUILD_ALGO_COMPARE src/cagra_build_algo_compare.cu)

@@ -2464,6 +2464,18 @@ void serialize_to_hnswlib(
  * candidates up to the requested output graph degree, and optimizing it to that degree. Unsupported
  * configurations retain the rebuild implementation.
  *
+ * @note: When every input to the graph-reuse path owns its attached dataset, merge consumes those
+ * datasets. On devices with CUDA virtual-memory support and the direct RMM cuda-memory resource,
+ * it reserves the final contiguous virtual range and commits physical pages one input at a time.
+ * Each input is copied device-to-device into its final offset and released before the next mapping,
+ * bounding temporary dataset memory by the largest input plus the CUDA allocation granularity.
+ * If VMM is unavailable, the active RMM resource is incompatible, or a VMM physical allocation
+ * fails, merge falls back to the prior direct device-to-device concatenation, temporarily retaining
+ * both the source and combined dataset allocations. A successful merge leaves the input indices
+ * graph-only and the returned index as the sole dataset owner. Existing input dataset views are
+ * invalidated. Non-owning allocations cannot be released and always retain the direct-copy
+ * behavior.
+ *
  * Usage example:
  * @code{.cpp}
  *   using namespace cuvs::neighbors;
@@ -2480,7 +2492,7 @@ void serialize_to_hnswlib(
  *
  * @param[in] res RAFT resources used for the merge operation.
  * @param[in] params Parameters that control the merging process.
- * @param[in] indices A vector of pointers to the CAGRA indices to merge. All indices must:
+ * @param[in,out] indices A vector of pointers to the CAGRA indices to merge. All indices must:
  *                    - Have attached datasets with the same dimension.
  * @param[in] row_filter an optional device filter function object that greenlights rows
  *    to include in the merged index  (none_sample_filter for no filtering)

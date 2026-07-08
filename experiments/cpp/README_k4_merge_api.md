@@ -3,7 +3,10 @@
 This worktree changes the physical `cuvs::neighbors::cagra::merge()` implementation for eligible
 merges. Unfiltered `L2Expanded` merges of at least two attached, uncompressed CAGRA indexes now:
 
-1. concatenate the input datasets on the device;
+1. for compatible owning inputs, reserve the final contiguous CUDA virtual range, map and D2D-copy
+   one input at a time, and release that input before mapping the next range; devices or RMM
+   resources incompatible with VMM, VMM physical-allocation failures, and non-owning inputs use the
+   prior direct device-to-device concatenation;
 2. preserve each input graph as a disconnected, offset-adjusted base graph;
 3. build eight independently seeded deterministic pivot trees (seed 1234 followed by
    `splitmix64`-derived seeds) with leaf size 256;
@@ -14,7 +17,7 @@ merges. Unfiltered `L2Expanded` merges of at least two attached, uncompressed CA
 7. distance-sort the dense graph in place;
 8. by default retain the first `index_params.graph_degree` unique candidates; then
 9. run the existing CAGRA graph optimizer to that requested degree; and
-10. return an index that owns both its aligned dataset and device graph.
+10. consume the input datasets and return an index that owns the contiguous dataset and device graph.
 
 The scaffold uses stable binary scatter rather than a global radix sort at every pivot level.
 Per-chunk counts preserve the checkpoint's active-first, stable ordering while transferring only
@@ -36,14 +39,83 @@ that matrix, avoiding optimizer host writeback and the subsequent host-to-device
 merge also uses an in-place device sort, avoiding scratch copies of an already-device-resident
 dataset and graph.
 
+### Dataset-memory behavior
+
+For owning inputs on a CUDA VMM-capable device using RMM's direct `cuda_memory_resource`, Fastener
+reserves the final contiguous virtual address range without committing physical memory. For each
+input it commits only the pages needed through that input's final logical offset, performs a
+device-to-device copy, synchronizes, and replaces the input dataset with a shared slice. Replacing
+the input releases its old physical allocation before the next pages are committed. The peak
+temporary dataset allocation is therefore at most the largest input plus one VMM allocation
+granule, rather than another full dataset. The H100 used here reports a 2 MiB granularity.
+
+Ordinary `cudaMalloc` allocations cannot themselves be remapped:
+`cuMemRetainAllocationHandle` rejects them. VMM is instead used to incrementally construct the
+final allocation at its permanent virtual address. Caching or custom RMM resources may retain freed
+physical pages in their own pools, so they use the prior direct device-copy fallback. Devices
+without CUDA VMM support use the same fallback. That path keeps all source allocations live while
+allocating and populating the combined matrix, reproducing the original two-copy peak.
+
+On the VMM path, input indexes remain attached to shared slices while graph construction runs so an
+exception still leaves them recoverable. The direct fallback leaves the original input allocations
+attached during graph construction. After a successful merge, all attachments are cleared and only
+the output retains the combined allocation. The inputs remain valid graph-only indexes and can be
+reused only after attaching the corresponding datasets again.
+
+The public merge signature is unchanged. Previously obtained input dataset views must not be used
+after merge because their backing allocations have been released. If any input dataset is
+non-owning, merge cannot free the caller's allocation; that case is not consumed and retains the
+prior direct device-to-device concatenation and its corresponding overlap.
+
 The rebuild implementation remains the fallback for filters, metrics other than `L2Expanded`
 (subject to existing rebuild support), compressed indexes, fewer than two inputs, unsupported
-degree combinations, and device allocation failure. The public merge function signature is
-unchanged.
+degree combinations. A VMM physical-allocation failure retries consolidation through the prior
+direct device-copy path. Later allocation failures in an eligible scaffold merge are propagated
+instead of automatically rebuilding, because rebuilding while recoverable input datasets remain
+alive could recreate the forbidden second full device dataset.
+
+### Device-memory and runtime tradeoff
+
+For the 1,000,000 x 768 float32 Wiki dataset, one logical dataset is 2.861 GiB. The prior
+device-to-device concatenation peaked at 5.722 GiB. Incremental VMM has a 2.8613 GiB steady
+allocation and adds at most one 368 MiB partition during consolidation, for a 3.220 GiB peak. These
+figures cover dataset vectors only; graph and bounded scaffold/GEMM workspaces are unchanged.
+
+Focused tests verify both paths: the compatibility fallback performs one additional combined device
+allocation and preserves every vector, while VMM preserves every vector across mappings and bounds
+incremental physical memory by the largest input plus one allocation granule.
+
+Two timed 8-way Wiki-1M runs on an NVIDIA H100 PCIe 80 GB give:
+
+| concatenation path | peak device dataset | extra host memory | mean merge | mean end-to-end | decision |
+| --- | ---: | ---: | ---: | ---: | --- |
+| prior direct device copy | 5.722 GiB | none | 1.047 s | 2.747 s | fallback |
+| incremental CUDA VMM | 3.220 GiB | none | 1.048 s | 2.692 s | retained |
+| pageable host staging | 2.861 GiB | 2.861 GiB pageable | 2.681 s | 4.380 s | rejected/removed |
+| register full host staging | 2.861 GiB | 2.861 GiB pinned | 2.622 s | 4.327 s | rejected |
+| pageable + 256 MiB pinned shuttle | 2.861 GiB | 2.861 GiB pageable + 256 MiB pinned | 3.288 s | 4.916 s | rejected |
+
+The VMM mean is 0.35 ms, or 0.03%, slower than the prior two-copy path—effectively identical—while
+being 2.56x faster than pageable staging. The standalone consolidation probe took 7.46 ms,
+including 0.22 ms for physical allocation, 0.57 ms for mapping/access, 4.29 ms for D2D copies and
+synchronization, and 2.33 ms to release the eight inputs.
+
+Pageable staging was removed: it is 2.56x slower than direct device copy, registering the full
+allocation recovered only 2.2% while pinning 2.861 GiB of host memory, and the smaller pinned
+shuttle was slower. The rejected experiment runs remain in
+[merge_api_results/device_memory_wiki8_20260708.csv](merge_api_results/device_memory_wiki8_20260708.csv);
+per-part VMM timings are in
+[merge_api_results/device_memory_vmm_microbenchmark_20260708.csv](merge_api_results/device_memory_vmm_microbenchmark_20260708.csv).
 
 ## Validation
 
 - Release instantiations compile with warnings-as-errors for float32, float16, int8, and uint8.
+- Focused tests prove the direct fallback creates one exact combined device allocation, VMM
+  produces one exact contiguous dataset with at most one input plus granularity of scratch, and a
+  successful Fastener merge leaves consumed inputs as graph-only indexes.
+- A full 8-way Wiki-1M VMM merge completed in 1.053 s and searched all 10,000 queries
+  at Recall@12 0.992608; the retained row is in
+  [merge_api_results/device_memory_vmm_search_20260708.csv](merge_api_results/device_memory_vmm_search_20260708.csv).
 - A leaf-64 fixed-input comparison found zero differences across 131,072 float32 and 131,072
   uint8 scaffold entries versus the checkpoint global-sort path.
 - Runtime smoke tests at the current leaf-256 default for all four datatypes verify graph bounds,
