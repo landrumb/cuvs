@@ -1,0 +1,3 @@
+oracle part 0 rows=3000000 built
+oracle part 1 rows=3000000 built
+RESULT dataset=Wiki-10M-prefix parts=2 implementation=rebuild merge_ms=23782.1 search_ms=150.062 recall=0.982508 qps=66639 scaffold_neighbors=4 scaffold_first_neighbors=4 scaffold_seed=1234 candidate_cap=64

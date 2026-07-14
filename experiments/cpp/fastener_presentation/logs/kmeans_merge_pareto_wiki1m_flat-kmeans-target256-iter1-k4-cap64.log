@@ -1,0 +1,20 @@
+oracle part 0 rows=125000 built
+oracle part 1 rows=125000 built
+oracle part 2 rows=125000 built
+oracle part 3 rows=125000 built
+oracle part 4 rows=125000 built
+oracle part 5 rows=125000 built
+oracle part 6 rows=125000 built
+oracle part 7 rows=125000 built
+kmeans scaffold clusters=3518 mode=flat-kmeans
+RESULT dataset=Wiki-1M parts=8 implementation=flat-kmeans-target256-iter1-k4-cap64 merge_ms=8763.22 search_ms=148.332 recall=0.983983 qps=67416.5 scaffold_neighbors=4 scaffold_first_neighbors=4 scaffold_seed=1234 candidate_cap=64
+oracle part 0 rows=125000 built
+oracle part 1 rows=125000 built
+oracle part 2 rows=125000 built
+oracle part 3 rows=125000 built
+oracle part 4 rows=125000 built
+oracle part 5 rows=125000 built
+oracle part 6 rows=125000 built
+oracle part 7 rows=125000 built
+kmeans scaffold clusters=3518 mode=flat-kmeans
+RESULT dataset=Wiki-1M parts=8 implementation=flat-kmeans-target256-iter1-k4-cap64 merge_ms=8720.06 search_ms=148.096 recall=0.984408 qps=67524 scaffold_neighbors=4 scaffold_first_neighbors=4 scaffold_seed=1234 candidate_cap=64

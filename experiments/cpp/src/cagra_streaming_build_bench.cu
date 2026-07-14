@@ -117,7 +117,7 @@ std::string usage() {
   --summary-csv <summary.csv>
   --parts-csv <parts.csv>
   --mode <local|network>
-  --build-path <naive-host|prefetch-device>
+  --build-path <naive-host|prefetch-device|prefetch-single-build>
   --parts <1|2|4|8>
   --run <positive integer>
   [--row-limit <rows>]
@@ -197,12 +197,19 @@ options parse_args(int argc, char **argv) {
   if (opts.mode != "local" && opts.mode != "network") {
     throw std::runtime_error("--mode must be local or network");
   }
-  if (opts.build_path != "naive-host" && opts.build_path != "prefetch-device") {
+  if (opts.build_path != "naive-host" && opts.build_path != "prefetch-device" &&
+      opts.build_path != "prefetch-single-build") {
     throw std::runtime_error(
-        "--build-path must be naive-host or prefetch-device");
+        "--build-path must be naive-host, prefetch-device, or "
+        "prefetch-single-build");
   }
   if (opts.build_path == "naive-host" && opts.parts != 1) {
     throw std::runtime_error("--build-path naive-host requires --parts 1");
+  }
+  if (opts.build_path == "prefetch-single-build" &&
+      (opts.mode != "network" || opts.parts != 8)) {
+    throw std::runtime_error(
+        "--build-path prefetch-single-build requires --mode network --parts 8");
   }
   if (opts.parts != 1 && opts.parts != 2 && opts.parts != 4 &&
       opts.parts != 8) {
@@ -927,6 +934,113 @@ int run_naive_host(options const &opts, source_info const &source,
   return 0;
 }
 
+int run_prefetch_single_build(options const &opts, source_info const &source,
+                              std::uint32_t rows,
+                              std::vector<part_spec> const &parts,
+                              std::vector<part_metrics> &metrics,
+                              double prepare_ms,
+                              std::vector<std::byte> const &network_payload) {
+  raft::resources resources;
+  pinned_copy_engine copy_engine(opts.io_chunk_bytes);
+  pipeline_state state(opts.parts);
+
+  auto total_start = clock_type::now();
+  std::thread downloader([&] {
+    try {
+      write_memory_parts(network_payload, parts, opts.io_chunk_bytes,
+                         opts.network_seconds, total_start, metrics, state);
+    } catch (...) {
+      set_error(state, std::current_exception());
+    }
+  });
+
+  interval allocation;
+  allocation.start_ms = relative_ms(total_start, clock_type::now());
+  auto device_dataset =
+      raft::make_device_matrix<float, int64_t>(resources, rows, source.dim);
+  allocation.end_ms = relative_ms(total_start, clock_type::now());
+
+  std::thread loader([&] {
+    try {
+      for (auto const &part : parts) {
+        {
+          std::unique_lock lock(state.mutex);
+          state.cv.wait(lock, [&] {
+            return state.downloaded[part.id] || state.error ||
+                   state.cancel.load();
+          });
+          if (state.error || state.cancel.load()) {
+            return;
+          }
+        }
+        auto offset = static_cast<std::uint64_t>(part.row_offset) * part.dim;
+        copy_engine.load(part, device_dataset.data_handle() + offset,
+                         total_start, metrics[part.id], false);
+        {
+          std::lock_guard lock(state.mutex);
+          state.loaded[part.id] = true;
+        }
+        state.cv.notify_all();
+      }
+    } catch (...) {
+      set_error(state, std::current_exception());
+    }
+  });
+
+  auto wait_start = clock_type::now();
+  try {
+    loader.join();
+    downloader.join();
+    rethrow_pipeline_error(state);
+  } catch (...) {
+    state.cancel.store(true);
+    state.cv.notify_all();
+    if (loader.joinable()) {
+      loader.join();
+    }
+    if (downloader.joinable()) {
+      downloader.join();
+    }
+    throw;
+  }
+
+  auto &build_metric = metrics.back();
+  build_metric.build_wait_ms = elapsed_ms(wait_start, clock_type::now());
+  build_metric.build.start_ms = relative_ms(total_start, clock_type::now());
+  cuvs::neighbors::cagra::index_params build_params;
+  build_params.attach_dataset_on_build = false;
+  auto view = raft::make_device_matrix_view<const float, int64_t>(
+      device_dataset.data_handle(), rows, source.dim);
+  auto final_index =
+      cuvs::neighbors::cagra::build(resources, build_params, view);
+  attach_owned_dataset(resources, final_index, std::move(device_dataset));
+  raft::resource::sync_stream(resources);
+  build_metric.build.end_ms = relative_ms(total_start, clock_type::now());
+
+  bool valid = final_index.size() == rows && final_index.dim() == source.dim &&
+               final_index.graph_degree() == 64 &&
+               final_index.graph().extent(0) == rows &&
+               final_index.dataset().extent(0) == rows &&
+               final_index.dataset().extent(1) == source.dim &&
+               final_index.data().is_owning();
+  if (!valid) {
+    throw std::runtime_error(
+        "Prefetch single-build CAGRA index failed validity checks");
+  }
+
+  auto total_ms = elapsed_ms(total_start, clock_type::now());
+  interval merge;
+  append_summary(opts, source, rows, prepare_ms, allocation, metrics, merge,
+                 total_ms, valid);
+  append_parts(opts, parts, metrics);
+  std::cout << std::fixed << std::setprecision(3) << "RESULT mode=" << opts.mode
+            << " build_path=" << opts.build_path << " parts=" << opts.parts
+            << " run=" << opts.run << " rows=" << rows
+            << " total_ms=" << total_ms << " merge_ms=0 valid=" << valid
+            << '\n';
+  return 0;
+}
+
 int run(options const &opts) {
   auto source = inspect_source(opts.dataset);
   auto rows = opts.row_limit == 0 ? source.rows : opts.row_limit;
@@ -968,6 +1082,10 @@ int run(options const &opts) {
   if (opts.build_path == "naive-host") {
     return run_naive_host(opts, source, rows, parts, metrics, prepare_ms,
                           network_payload);
+  }
+  if (opts.build_path == "prefetch-single-build") {
+    return run_prefetch_single_build(opts, source, rows, parts, metrics,
+                                     prepare_ms, network_payload);
   }
 
   if (opts.parts > 1) {

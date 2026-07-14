@@ -1,0 +1,4 @@
+error: Unknown argument: --rows
+oracle part 0 rows=500000 built
+oracle part 1 rows=500000 built
+RESULT dataset=Wiki-10M-prefix parts=2 implementation=k4-scaffold-cap64 merge_ms=1065.18 search_ms=144.065 recall=0.994058 qps=69413.2 scaffold_neighbors=4 scaffold_first_neighbors=4 scaffold_seed=1234 candidate_cap=64

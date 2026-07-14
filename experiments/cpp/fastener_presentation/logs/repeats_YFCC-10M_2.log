@@ -1,0 +1,8 @@
+oracle part 0 rows=5000000 built
+oracle part 1 rows=5000000 built
+RESULT dataset=YFCC-10M parts=2 implementation=k4-scaffold-repeat1-cap64 merge_ms=1319.6 search_ms=295.824 recall=0.984775 qps=338039 scaffold_neighbors=4 scaffold_first_neighbors=4 scaffold_seed=1234 candidate_cap=64
+RESULT dataset=YFCC-10M parts=2 implementation=k4-scaffold-repeat2-cap64 merge_ms=1495.28 search_ms=297.581 recall=0.985505 qps=336043 scaffold_neighbors=4 scaffold_first_neighbors=4 scaffold_seed=1234 candidate_cap=64
+RESULT dataset=YFCC-10M parts=2 implementation=k4-scaffold-repeat4-cap64 merge_ms=1855.55 search_ms=298.236 recall=0.986528 qps=335305 scaffold_neighbors=4 scaffold_first_neighbors=4 scaffold_seed=1234 candidate_cap=64
+RESULT dataset=YFCC-10M parts=2 implementation=k4-scaffold-repeat8-cap64 merge_ms=2547.17 search_ms=297.689 recall=0.987947 qps=335921 scaffold_neighbors=4 scaffold_first_neighbors=4 scaffold_seed=1234 candidate_cap=64
+RESULT dataset=YFCC-10M parts=2 implementation=k4-scaffold-repeat16-cap64 merge_ms=4021.08 search_ms=298.966 recall=0.989505 qps=334486 scaffold_neighbors=4 scaffold_first_neighbors=4 scaffold_seed=1234 candidate_cap=64
+RESULT dataset=YFCC-10M parts=2 implementation=k4-scaffold-repeat32-cap64 merge_ms=7094.09 search_ms=298.102 recall=0.990696 qps=335456 scaffold_neighbors=4 scaffold_first_neighbors=4 scaffold_seed=1234 candidate_cap=64

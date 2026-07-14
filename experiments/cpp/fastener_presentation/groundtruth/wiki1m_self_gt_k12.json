@@ -1,0 +1,22 @@
+{
+  "batch_size": 32,
+  "dataset": "/raid/blandrum/local_datasets/wiki_all_1M/base.1M.fbin",
+  "dataset_rows": 1000000,
+  "dimension": 768,
+  "distance_dtype": "float32",
+  "distances": "wiki1m_self_gt_k12_distances.fbin",
+  "distances_sha256": "375dd37bb8f27ddf76449acc9ec4e3cda2e9071da012ff3d1a362bed28cee80b",
+  "k": 12,
+  "method": "exact exhaustive squared-L2 GPU search",
+  "neighbors": "wiki1m_self_gt_k12.ibin",
+  "neighbors_sha256": "455af42256cd6dd94368489ed0e69a5f60236c253ed45b0be5f77573ec77463b",
+  "sample_ids": "wiki1m_sample_ids.ibin",
+  "sample_ids_sha256": "e7687acd49d2bb7a39e04913492fb97f33a3eb51f07353ce2c1ff90142a4c2c6",
+  "sample_size": 4096,
+  "search_seconds": 4.504258106928319,
+  "seed": 20260709,
+  "self_edges_excluded": true,
+  "source_dtype": "float32",
+  "tf32_enabled": false,
+  "upload_seconds": 2.601840720977634
+}

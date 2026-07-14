@@ -1,0 +1,9 @@
+oracle part 0 rows=290137 built
+oracle part 1 rows=290137 built
+oracle part 2 rows=290137 built
+oracle part 3 rows=290137 built
+oracle part 4 rows=290137 built
+oracle part 5 rows=290137 built
+oracle part 6 rows=290137 built
+oracle part 7 rows=290137 built
+RESULT dataset=OpenAI-2M parts=8 implementation=native-knn-k32 merge_ms=22693.9 search_ms=589.758 recall=0.972221 qps=33912.2 scaffold_neighbors=4 scaffold_first_neighbors=4 scaffold_seed=1234 candidate_cap=64

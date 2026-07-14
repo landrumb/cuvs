@@ -34,7 +34,10 @@ inline constexpr int k_degree                         = 4;
 inline constexpr int k_default_repeats                = 8;
 inline constexpr int64_t k_cap_to_output_graph_degree = -1;
 inline constexpr int k_max_degree                     = 32;
-inline constexpr int k_cluster_size                   = 256;
+#ifndef CUVS_MERGE_SCAFFOLD_CLUSTER_SIZE
+#define CUVS_MERGE_SCAFFOLD_CLUSTER_SIZE 256
+#endif
+inline constexpr int k_cluster_size = CUVS_MERGE_SCAFFOLD_CLUSTER_SIZE;
 static_assert(k_cluster_size > 0 && k_cluster_size <= 1024);
 inline constexpr int k_pivot_block_size = 128;
 
@@ -56,6 +59,7 @@ struct build_params {
   int pivot_assign_chunk              = 256;
   int leaf_assign_chunk               = 1024;
   int max_pivot_tree_levels           = 64;
+  int pivot_arity                     = 2;
   int repeats                         = k_default_repeats;
   int neighbors_per_leaf              = k_degree;
   int first_repeat_neighbors_per_leaf = 0;
@@ -77,6 +81,7 @@ struct pivot_chunk {
   uint32_t end         = 0;
   uint32_t pivot_a     = 0;
   uint32_t pivot_b     = 0;
+  uint32_t pivot_c     = 0;
   uint32_t range_index = 0;
   uint8_t active       = 0;
 };
@@ -84,6 +89,12 @@ struct pivot_chunk {
 struct scatter_offset {
   uint32_t left  = 0;
   uint32_t right = 0;
+};
+
+struct ternary_scatter_offset {
+  uint32_t first  = 0;
+  uint32_t second = 0;
+  uint32_t third  = 0;
 };
 
 __host__ __device__ inline uint64_t splitmix64(uint64_t x)
@@ -123,6 +134,7 @@ inline int make_pivot_chunks(std::vector<host_range> const& ranges,
     bool active       = n > k_cluster_size;
     uint32_t pivot_a  = 0;
     uint32_t pivot_b  = 0;
+    uint32_t pivot_c  = 0;
     int chunk_size    = active ? params.pivot_assign_chunk : params.leaf_assign_chunk;
 
     if (active) {
@@ -131,8 +143,13 @@ inline int make_pivot_chunks(std::vector<host_range> const& ranges,
       int64_t off_a = static_cast<int64_t>(h % static_cast<uint64_t>(n));
       int64_t off_b = static_cast<int64_t>(splitmix64(h) % static_cast<uint64_t>(n));
       if (off_a == off_b) { off_b = (off_b + 1) % n; }
+      int64_t off_c = static_cast<int64_t>(splitmix64(splitmix64(h)) % static_cast<uint64_t>(n));
+      while (off_c == off_a || off_c == off_b) {
+        off_c = (off_c + 1) % n;
+      }
       pivot_a = static_cast<uint32_t>(range.start + off_a);
       pivot_b = static_cast<uint32_t>(range.start + off_b);
+      pivot_c = static_cast<uint32_t>(range.start + off_c);
     }
 
     for (int64_t chunk_start = range.start; chunk_start < range.end; chunk_start += chunk_size) {
@@ -141,6 +158,7 @@ inline int make_pivot_chunks(std::vector<host_range> const& ranges,
          static_cast<uint32_t>(std::min<int64_t>(range.end, chunk_start + chunk_size)),
          pivot_a,
          pivot_b,
+         pivot_c,
          static_cast<uint32_t>(r),
          static_cast<uint8_t>(active ? 1 : 0)});
     }
@@ -218,6 +236,80 @@ inline auto prepare_scatter(std::vector<host_range> const& ranges,
     }
   }
 
+  active_ranges.insert(active_ranges.end(), leaf_ranges.begin(), leaf_ranges.end());
+  return active_ranges;
+}
+inline auto prepare_ternary_scatter(std::vector<host_range> const& ranges,
+                                    std::vector<uint3> const& chunk_counts,
+                                    std::vector<pivot_chunk> const& chunks,
+                                    std::vector<ternary_scatter_offset>& scatter_offsets)
+  -> std::vector<host_range>
+{
+  RAFT_EXPECTS(chunk_counts.size() == chunks.size(), "Ternary pivot chunk count mismatch");
+  scatter_offsets.resize(chunks.size());
+  std::vector<uint3> range_counts(ranges.size(), make_uint3(0, 0, 0));
+  int64_t active_rows = 0;
+  for (size_t r = 0; r < ranges.size(); ++r) {
+    if (ranges[r].end - ranges[r].start > k_cluster_size) {
+      active_rows += ranges[r].end - ranges[r].start;
+    }
+  }
+  for (size_t i = 0; i < chunks.size(); ++i) {
+    if (!chunks[i].active) { continue; }
+    auto& count = range_counts[chunks[i].range_index];
+    count.x += chunk_counts[i].x;
+    count.y += chunk_counts[i].y;
+    count.z += chunk_counts[i].z;
+  }
+
+  std::vector<uint3> bases(ranges.size(), make_uint3(0, 0, 0));
+  std::vector<int64_t> leaf_bases(ranges.size(), 0);
+  std::vector<host_range> active_ranges;
+  std::vector<host_range> leaf_ranges;
+  active_ranges.reserve(ranges.size() * 3);
+  leaf_ranges.reserve(ranges.size());
+  int64_t active_cursor = 0;
+  int64_t leaf_cursor   = active_rows;
+  for (size_t r = 0; r < ranges.size(); ++r) {
+    int64_t n = ranges[r].end - ranges[r].start;
+    if (n > k_cluster_size) {
+      auto count = range_counts[r];
+      bases[r]   = make_uint3(static_cast<uint32_t>(active_cursor),
+                            static_cast<uint32_t>(active_cursor + count.x),
+                            static_cast<uint32_t>(active_cursor + count.x + count.y));
+      if (count.x > 0) { active_ranges.push_back({active_cursor, active_cursor + count.x}); }
+      if (count.y > 0) {
+        active_ranges.push_back({active_cursor + count.x, active_cursor + count.x + count.y});
+      }
+      if (count.z > 0) {
+        active_ranges.push_back({active_cursor + count.x + count.y, active_cursor + n});
+      }
+      active_cursor += n;
+    } else {
+      leaf_bases[r] = leaf_cursor;
+      leaf_ranges.push_back({leaf_cursor, leaf_cursor + n});
+      leaf_cursor += n;
+    }
+  }
+
+  std::vector<uint3> prefixes(ranges.size(), make_uint3(0, 0, 0));
+  for (size_t i = 0; i < chunks.size(); ++i) {
+    auto const& chunk = chunks[i];
+    auto& output      = scatter_offsets[i];
+    size_t r          = chunk.range_index;
+    if (chunk.active) {
+      output.first  = bases[r].x + prefixes[r].x;
+      output.second = bases[r].y + prefixes[r].y;
+      output.third  = bases[r].z + prefixes[r].z;
+      prefixes[r].x += chunk_counts[i].x;
+      prefixes[r].y += chunk_counts[i].y;
+      prefixes[r].z += chunk_counts[i].z;
+    } else {
+      output.first  = static_cast<uint32_t>(leaf_bases[r] + chunk.start - ranges[r].start);
+      output.second = output.first;
+      output.third  = output.first;
+    }
+  }
   active_ranges.insert(active_ranges.end(), leaf_ranges.begin(), leaf_ranges.end());
   return active_ranges;
 }
@@ -387,6 +479,91 @@ static __global__ void stable_scatter_kernel(uint32_t const* input_ids,
   }
 }
 
+template <typename T>
+__global__ void pivot_assign_ternary_kernel(T const* dataset,
+                                            int64_t dim,
+                                            uint32_t const* ids,
+                                            pivot_chunk const* chunks,
+                                            int64_t chunk_count,
+                                            uint8_t* sides,
+                                            uint3* chunk_counts)
+{
+  int64_t chunk_idx = blockIdx.x;
+  if (chunk_idx >= chunk_count) { return; }
+  pivot_chunk chunk = chunks[chunk_idx];
+  uint3 local       = make_uint3(0, 0, 0);
+  if (chunk.active) {
+    uint32_t pivots[3] = {ids[chunk.pivot_a], ids[chunk.pivot_b], ids[chunk.pivot_c]};
+    for (int64_t pos = chunk.start + threadIdx.x; pos < chunk.end; pos += blockDim.x) {
+      uint32_t id        = ids[pos];
+      float distances[3] = {l2_distance(dataset, dim, id, pivots[0]),
+                            l2_distance(dataset, dim, id, pivots[1]),
+                            l2_distance(dataset, dim, id, pivots[2])};
+      uint8_t side       = 0;
+      if (distances[1] < distances[side]) { side = 1; }
+      if (distances[2] < distances[side]) { side = 2; }
+      sides[pos] = side;
+      local.x += side == 0;
+      local.y += side == 1;
+      local.z += side == 2;
+    }
+  }
+
+  __shared__ uint3 reduction[k_pivot_block_size];
+  reduction[threadIdx.x] = local;
+  __syncthreads();
+  for (int offset = blockDim.x / 2; offset > 0; offset /= 2) {
+    if (threadIdx.x < offset) {
+      reduction[threadIdx.x].x += reduction[threadIdx.x + offset].x;
+      reduction[threadIdx.x].y += reduction[threadIdx.x + offset].y;
+      reduction[threadIdx.x].z += reduction[threadIdx.x + offset].z;
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) { chunk_counts[chunk_idx] = reduction[0]; }
+}
+
+static __global__ void stable_ternary_scatter_kernel(uint32_t const* input_ids,
+                                                     uint8_t const* sides,
+                                                     pivot_chunk const* chunks,
+                                                     ternary_scatter_offset const* scatter_offsets,
+                                                     int64_t chunk_count,
+                                                     uint32_t* output_ids)
+{
+  int64_t chunk_idx = blockIdx.x;
+  if (chunk_idx >= chunk_count) { return; }
+  pivot_chunk chunk                  = chunks[chunk_idx];
+  ternary_scatter_offset output_base = scatter_offsets[chunk_idx];
+  if (!chunk.active) {
+    for (int64_t pos = chunk.start + threadIdx.x; pos < chunk.end; pos += blockDim.x) {
+      output_ids[output_base.first + pos - chunk.start] = input_ids[pos];
+    }
+    return;
+  }
+
+  int64_t pos  = chunk.start + threadIdx.x;
+  bool valid   = pos < chunk.end;
+  uint8_t side = valid ? sides[pos] : 0;
+  __shared__ uint32_t prefixes[3][256];
+  for (int group = 0; group < 3; ++group) {
+    prefixes[group][threadIdx.x] = valid && side == group ? 1u : 0u;
+  }
+  __syncthreads();
+  for (int group = 0; group < 3; ++group) {
+    for (int offset = 1; offset < blockDim.x; offset *= 2) {
+      uint32_t add = threadIdx.x >= offset ? prefixes[group][threadIdx.x - offset] : 0;
+      __syncthreads();
+      if (threadIdx.x >= offset) { prefixes[group][threadIdx.x] += add; }
+      __syncthreads();
+    }
+  }
+
+  if (valid) {
+    uint32_t bases[3]                = {output_base.first, output_base.second, output_base.third};
+    uint32_t before                  = prefixes[side][threadIdx.x] - 1;
+    output_ids[bases[side] + before] = input_ids[pos];
+  }
+}
 static __global__ void initialize_partition_kernel(uint32_t* origins,
                                                    uint32_t* fallback,
                                                    int64_t start,
@@ -673,6 +850,8 @@ auto build_once_impl(raft::resources const& res,
   RAFT_EXPECTS(params.pivot_assign_chunk > 0 && params.leaf_assign_chunk > 0 &&
                  params.max_pivot_tree_levels > 0,
                "k=4 scaffold merge runtime chunk sizes and level cap must be positive");
+  RAFT_EXPECTS(params.pivot_arity == 2 || params.pivot_arity == 3,
+               "Scaffold pivot arity must be two or three");
 
   auto graph = raft::make_device_matrix<uint32_t, int64_t>(res, rows, Degree);
   rmm::device_uvector<uint8_t> degrees(rows, stream);
@@ -709,41 +888,83 @@ auto build_once_impl(raft::resources const& res,
   rmm::device_uvector<pivot_chunk> device_chunks(0, stream);
   rmm::device_uvector<uint32_t> device_left_counts(0, stream);
   rmm::device_uvector<scatter_offset> device_scatter_offsets(0, stream);
+  std::vector<uint3> chunk_ternary_counts;
+  std::vector<ternary_scatter_offset> ternary_scatter_offsets;
+  rmm::device_uvector<uint3> device_ternary_counts(0, stream);
+  rmm::device_uvector<ternary_scatter_offset> device_ternary_scatter_offsets(0, stream);
 
   for (int level = 0; level < params.max_pivot_tree_levels; ++level) {
     int active_count = make_pivot_chunks(ranges, level, params, chunks);
     if (active_count == 0) { break; }
 
     device_chunks.resize(chunks.size(), stream);
-    device_left_counts.resize(chunks.size(), stream);
     raft::copy(device_chunks.data(), chunks.data(), chunks.size(), stream);
-    pivot_assign_sides_kernel<<<static_cast<int>(chunks.size()), k_pivot_block_size, 0, stream>>>(
-      dataset.data_handle(),
-      dataset.extent(1),
-      ids.data(),
-      device_chunks.data(),
-      static_cast<int64_t>(chunks.size()),
-      sides.data(),
-      device_left_counts.data());
-    RAFT_CUDA_TRY(cudaGetLastError());
+    if (params.pivot_arity == 2) {
+      device_left_counts.resize(chunks.size(), stream);
+      pivot_assign_sides_kernel<<<static_cast<int>(chunks.size()), k_pivot_block_size, 0, stream>>>(
+        dataset.data_handle(),
+        dataset.extent(1),
+        ids.data(),
+        device_chunks.data(),
+        static_cast<int64_t>(chunks.size()),
+        sides.data(),
+        device_left_counts.data());
+      RAFT_CUDA_TRY(cudaGetLastError());
 
-    chunk_left_counts.resize(chunks.size());
-    raft::copy(
-      chunk_left_counts.data(), device_left_counts.data(), device_left_counts.size(), stream);
-    raft::resource::sync_stream(res);
-    ranges = prepare_scatter(ranges, chunk_left_counts, chunks, scatter_offsets);
+      chunk_left_counts.resize(chunks.size());
+      raft::copy(
+        chunk_left_counts.data(), device_left_counts.data(), device_left_counts.size(), stream);
+      raft::resource::sync_stream(res);
+      ranges = prepare_scatter(ranges, chunk_left_counts, chunks, scatter_offsets);
 
-    device_scatter_offsets.resize(scatter_offsets.size(), stream);
-    raft::copy(
-      device_scatter_offsets.data(), scatter_offsets.data(), scatter_offsets.size(), stream);
-    stable_scatter_kernel<<<static_cast<int>(chunks.size()), 256, 0, stream>>>(
-      ids.data(),
-      sides.data(),
-      device_chunks.data(),
-      device_scatter_offsets.data(),
-      static_cast<int64_t>(chunks.size()),
-      next_ids.data());
-    RAFT_CUDA_TRY(cudaGetLastError());
+      device_scatter_offsets.resize(scatter_offsets.size(), stream);
+      raft::copy(
+        device_scatter_offsets.data(), scatter_offsets.data(), scatter_offsets.size(), stream);
+      stable_scatter_kernel<<<static_cast<int>(chunks.size()), 256, 0, stream>>>(
+        ids.data(),
+        sides.data(),
+        device_chunks.data(),
+        device_scatter_offsets.data(),
+        static_cast<int64_t>(chunks.size()),
+        next_ids.data());
+      RAFT_CUDA_TRY(cudaGetLastError());
+    } else {
+      device_ternary_counts.resize(chunks.size(), stream);
+      pivot_assign_ternary_kernel<<<static_cast<int>(chunks.size()),
+                                    k_pivot_block_size,
+                                    0,
+                                    stream>>>(dataset.data_handle(),
+                                              dataset.extent(1),
+                                              ids.data(),
+                                              device_chunks.data(),
+                                              static_cast<int64_t>(chunks.size()),
+                                              sides.data(),
+                                              device_ternary_counts.data());
+      RAFT_CUDA_TRY(cudaGetLastError());
+
+      chunk_ternary_counts.resize(chunks.size());
+      raft::copy(chunk_ternary_counts.data(),
+                 device_ternary_counts.data(),
+                 device_ternary_counts.size(),
+                 stream);
+      raft::resource::sync_stream(res);
+      ranges =
+        prepare_ternary_scatter(ranges, chunk_ternary_counts, chunks, ternary_scatter_offsets);
+
+      device_ternary_scatter_offsets.resize(ternary_scatter_offsets.size(), stream);
+      raft::copy(device_ternary_scatter_offsets.data(),
+                 ternary_scatter_offsets.data(),
+                 ternary_scatter_offsets.size(),
+                 stream);
+      stable_ternary_scatter_kernel<<<static_cast<int>(chunks.size()), 256, 0, stream>>>(
+        ids.data(),
+        sides.data(),
+        device_chunks.data(),
+        device_ternary_scatter_offsets.data(),
+        static_cast<int64_t>(chunks.size()),
+        next_ids.data());
+      RAFT_CUDA_TRY(cudaGetLastError());
+    }
     std::swap(ids, next_ids);
   }
 

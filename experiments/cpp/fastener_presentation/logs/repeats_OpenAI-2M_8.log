@@ -1,0 +1,14 @@
+oracle part 0 rows=290137 built
+oracle part 1 rows=290137 built
+oracle part 2 rows=290137 built
+oracle part 3 rows=290137 built
+oracle part 4 rows=290137 built
+oracle part 5 rows=290137 built
+oracle part 6 rows=290137 built
+oracle part 7 rows=290137 built
+RESULT dataset=OpenAI-2M parts=8 implementation=k4-scaffold-repeat1-cap64 merge_ms=1428.38 search_ms=609.93 recall=0.920125 qps=32790.6 scaffold_neighbors=4 scaffold_first_neighbors=4 scaffold_seed=1234 candidate_cap=64
+RESULT dataset=OpenAI-2M parts=8 implementation=k4-scaffold-repeat2-cap64 merge_ms=1892.5 search_ms=609.341 recall=0.936113 qps=32822.3 scaffold_neighbors=4 scaffold_first_neighbors=4 scaffold_seed=1234 candidate_cap=64
+RESULT dataset=OpenAI-2M parts=8 implementation=k4-scaffold-repeat4-cap64 merge_ms=2784.92 search_ms=607.567 recall=0.947117 qps=32918.2 scaffold_neighbors=4 scaffold_first_neighbors=4 scaffold_seed=1234 candidate_cap=64
+RESULT dataset=OpenAI-2M parts=8 implementation=k4-scaffold-repeat8-cap64 merge_ms=4637.03 search_ms=602.178 recall=0.956042 qps=33212.8 scaffold_neighbors=4 scaffold_first_neighbors=4 scaffold_seed=1234 candidate_cap=64
+RESULT dataset=OpenAI-2M parts=8 implementation=k4-scaffold-repeat16-cap64 merge_ms=8221.79 search_ms=594.408 recall=0.963504 qps=33646.9 scaffold_neighbors=4 scaffold_first_neighbors=4 scaffold_seed=1234 candidate_cap=64
+RESULT dataset=OpenAI-2M parts=8 implementation=k4-scaffold-repeat32-cap64 merge_ms=16093.5 search_ms=584.818 recall=0.968575 qps=34198.7 scaffold_neighbors=4 scaffold_first_neighbors=4 scaffold_seed=1234 candidate_cap=64

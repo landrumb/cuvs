@@ -1,0 +1,3 @@
+oracle part 0 rows=1160548 built
+oracle part 1 rows=1160548 built
+RESULT dataset=OpenAI-2M parts=2 implementation=rebuild merge_ms=12915.8 search_ms=583.259 recall=0.967929 qps=34290.1 scaffold_neighbors=4 scaffold_first_neighbors=4 scaffold_seed=1234 candidate_cap=64

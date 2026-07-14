@@ -21,10 +21,16 @@ CONFIGS = (
     ("prefetch-device", 4),
     ("prefetch-device", 8),
 )
+NETWORK_ONLY_CONFIGS = (("prefetch-single-build", 8),)
+CONFIGS_BY_MODE = {
+    "local": CONFIGS,
+    "network": CONFIGS[:1] + NETWORK_ONLY_CONFIGS + CONFIGS[1:],
+}
 MODES = ("local", "network")
 RUNS = {1, 2}
 DISPLAY_LABELS = {
     ("naive-host", 1): "Naive\nhost",
+    ("prefetch-single-build", 8): "Transfer pipeline\n+ single build",
     ("prefetch-device", 1): "Prefetch\n1 chunk",
     ("prefetch-device", 2): "Pipeline\n2 chunks",
     ("prefetch-device", 4): "Pipeline\n4 chunks",
@@ -115,7 +121,11 @@ def load_summary(path):
         for line, row in enumerate(reader, start=2):
             key = (row["mode"], row["build_path"], int(row["parts"]))
             run = int(row["run"])
-            if key not in {(mode, *config) for mode in MODES for config in CONFIGS}:
+            if key not in {
+                (mode, *config)
+                for mode in MODES
+                for config in CONFIGS_BY_MODE[mode]
+            }:
                 raise RuntimeError(f"unexpected configuration on line {line}: {key}")
             if run in seen_runs[key]:
                 raise RuntimeError(f"duplicate run {run} for {key}")
@@ -146,7 +156,11 @@ def load_summary(path):
                 parsed[field] = float(row[field])
             groups[key].append(parsed)
 
-    expected = {(mode, *config) for mode in MODES for config in CONFIGS}
+    expected = {
+                (mode, *config)
+                for mode in MODES
+                for config in CONFIGS_BY_MODE[mode]
+            }
     actual = set(groups)
     if actual != expected:
         raise RuntimeError(
@@ -211,7 +225,7 @@ def summarize(groups):
         prefetch_total = mean(
             row["total_ms"] for row in groups[(mode, "prefetch-device", 1)]
         )
-        for build_path, parts in CONFIGS:
+        for build_path, parts in CONFIGS_BY_MODE[mode]:
             samples = groups[(mode, build_path, parts)]
             row = {
                 "mode": mode,
@@ -271,7 +285,7 @@ def write_aggregate(path, summary):
         writer = csv.DictWriter(stream, fieldnames=fieldnames, lineterminator="\n")
         writer.writeheader()
         for mode in MODES:
-            for build_path, parts in CONFIGS:
+            for build_path, parts in CONFIGS_BY_MODE[mode]:
                 row = summary[(mode, build_path, parts)]
                 writer.writerow(
                     {
@@ -339,9 +353,14 @@ def write_aggregate(path, summary):
 def plot_total(path, summary, mode):
     path.parent.mkdir(parents=True, exist_ok=True)
     fig, axis = plt.subplots(figsize=(12.8, 7.2))
-    x = list(range(len(CONFIGS)))
-    labels = [DISPLAY_LABELS[config] for config in CONFIGS]
-    rows = [summary[(mode, *config)] for config in CONFIGS]
+    configs = tuple(
+        config
+        for config in CONFIGS_BY_MODE[mode]
+        if config != ("prefetch-device", 1)
+    )
+    x = list(range(len(configs)))
+    labels = [DISPLAY_LABELS[config] for config in configs]
+    rows = [summary[(mode, *config)] for config in configs]
     values = [row["total_ms"] / 1000.0 for row in rows]
     errors = [
         [
@@ -359,7 +378,18 @@ def plot_total(path, summary, mode):
         yerr=errors,
         capsize=5,
         width=0.68,
-        color=COLORS[mode],
+        color=(
+            [
+                "#8b95a5"
+                if config == ("naive-host", 1)
+                else "#29384f"
+                if config == ("prefetch-single-build", 8)
+                else COLORS[mode]
+                for config in configs
+            ]
+            if mode == "network"
+            else COLORS[mode]
+        ),
         edgecolor="white",
         linewidth=0.8,
     )
@@ -577,13 +607,13 @@ def plot_timeline_mode(path, summary_groups, parts_groups, run, mode):
 def plot_network_speedup(path, summary_groups, parts_groups, run):
     path.parent.mkdir(parents=True, exist_ok=True)
     fig, axes = plt.subplots(
-        2,
+        3,
         1,
         figsize=(12.8, 7.2),
         sharex=True,
-        gridspec_kw={"height_ratios": [1.0, 3.5]},
+        gridspec_kw={"height_ratios": [1.0, 3.5, 3.5]},
     )
-    naive_axis, pipeline_axis = axes
+    naive_axis, single_axis, pipeline_axis = axes
     colors = {
         "Download": COLORS["download"],
         "Load / transfer": COLORS["load"],
@@ -639,12 +669,77 @@ def plot_network_speedup(path, summary_groups, parts_groups, run):
         f"{naive_summary['total_ms'] / 1000.0:.2f} s",
         ha="right",
         va="center",
-        color="black",
+        color="white",
         fontsize=10,
     )
     naive_axis.set_yticks((0,), ("Full dataset",))
     naive_axis.set_title("Serialized full-dataset construction")
     naive_axis.grid(axis="x", alpha=0.25)
+
+    single_parts = parts_groups[
+        ("network", "prefetch-single-build", 8, run)
+    ]
+    for part in single_parts:
+        y = part["part"]
+        for label, start, end in (
+            (
+                "Download",
+                part["download_start_ms"],
+                part["download_end_ms"],
+            ),
+            (
+                "Load / transfer",
+                part["load_start_ms"],
+                part["load_end_ms"],
+            ),
+        ):
+            single_axis.barh(
+                y,
+                (end - start) / 1000.0,
+                left=start / 1000.0,
+                height=0.58,
+                color=colors[label],
+                edgecolor="white",
+                linewidth=0.4,
+            )
+    single_build = next(part for part in single_parts if part["build_end_ms"] > 0.0)
+    single_axis.barh(
+        8,
+        (single_build["build_end_ms"] - single_build["build_start_ms"])
+        / 1000.0,
+        left=single_build["build_start_ms"] / 1000.0,
+        height=0.58,
+        color=colors["CAGRA build"],
+        edgecolor="white",
+        linewidth=0.4,
+    )
+    single_summary = next(
+        row
+        for row in summary_groups[("network", "prefetch-single-build", 8)]
+        if row["run"] == run
+    )
+    single_axis.axvline(
+        single_summary["total_ms"] / 1000.0,
+        color=COLORS["total"],
+        linewidth=1.3,
+        linestyle="--",
+    )
+    single_axis.text(
+        single_summary["total_ms"] / 1000.0 - 0.7,
+        7.55,
+        f"{single_summary['total_ms'] / 1000.0:.2f} s",
+        ha="right",
+        va="bottom",
+        color="black",
+        fontsize=10,
+    )
+    single_axis.set_yticks(
+        range(9),
+        [f"Part {part}" for part in range(8)] + ["Full build"],
+    )
+    single_axis.invert_yaxis()
+    single_axis.set_title("Eight-chunk transfer pipeline, then one CAGRA build")
+    single_axis.grid(axis="x", alpha=0.25)
 
     pipeline_parts = parts_groups[
         ("network", "prefetch-device", 8, run)
@@ -704,10 +799,10 @@ def plot_network_speedup(path, summary_groups, parts_groups, run):
     )
     pipeline_axis.text(
         pipeline_summary["total_ms"] / 1000.0 - 0.7,
-        8,
+        7.55,
         f"{pipeline_summary['total_ms'] / 1000.0:.2f} s",
         ha="right",
-        va="center",
+        va="bottom",
         color="black",
         fontsize=10,
     )
@@ -729,7 +824,7 @@ def plot_network_speedup(path, summary_groups, parts_groups, run):
         "CAGRA build",
         "Fastener merge",
     )
-    naive_axis.legend(
+    pipeline_axis.legend(
         [legend_handles[label] for label in legend_order],
         legend_order,
         ncol=4,
@@ -740,7 +835,7 @@ def plot_network_speedup(path, summary_groups, parts_groups, run):
         loc="upper right",
     )
     fig.suptitle(
-        "OpenAI-5M network construction: serialized versus pipelined",
+        "OpenAI-5M construction strategies",
         fontsize=16,
     )
     fig.tight_layout()

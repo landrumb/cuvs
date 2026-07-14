@@ -1,0 +1,4 @@
+dataset,record_type,parts,method,dtype,rows,dim,leaf_size,repeats,neighbors_per_leaf,sample_rows,k,seed,incremental_ms,cumulative_ms,leaf_count,min_leaf_size,mean_leaf_size,max_leaf_size,nn_same_partition_rate,implicit_knn_recall,implicit_cross_knn_recall,implicit_unique_degree_mean
+Wiki-1M,partition-kmeans-flat,0,kmeans-balanced-flat-iter20,float32,1000000,768,256,1,0,4096,12,0,6380.657634,6380.657634,3907,61,255.950857,15355,0.550395,nan,nan,nan
+OpenAI-2M,partition-kmeans-flat,0,kmeans-balanced-flat-iter20,float32,2321096,1536,256,1,0,4096,12,0,76533.270186,76533.270186,9067,64,255.993824,1644,0.476054,nan,nan,nan
+YFCC-10M,partition-kmeans-flat,0,kmeans-balanced-flat-iter20,uint8,10000000,192,256,1,0,4096,12,0,171602.072758,171602.072758,39063,64,255.996723,1330,0.340861,nan,nan,nan

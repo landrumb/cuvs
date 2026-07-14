@@ -1,0 +1,6 @@
+oracle part 0 rows=500000 built
+oracle part 1 rows=500000 built
+RESULT dataset=Wiki-10M-prefix parts=2 implementation=rebuild merge_ms=3698.34 search_ms=141.235 recall=0.991875 qps=70804.1 scaffold_neighbors=4 scaffold_first_neighbors=4 scaffold_seed=1234 candidate_cap=64
+oracle part 0 rows=500000 built
+oracle part 1 rows=500000 built
+RESULT dataset=Wiki-10M-prefix parts=2 implementation=rebuild merge_ms=3715.41 search_ms=142.19 recall=0.992583 qps=70328.5 scaffold_neighbors=4 scaffold_first_neighbors=4 scaffold_seed=1234 candidate_cap=64

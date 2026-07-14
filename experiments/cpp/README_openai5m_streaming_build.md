@@ -3,7 +3,9 @@
 This experiment measures whether OpenAI-5M CAGRA construction becomes faster when the dataset is
 split into 1, 2, 4, or 8 chunks and disk read, pinned host-to-device transfer, CAGRA construction,
 and the final Fastener merge are pipelined. It covers construction only: no queries, ground truth,
-search, or recall measurements are part of this study.
+search, or recall measurements are part of this study. A separate eight-chunk baseline overlaps
+download and H2D but waits to run one full-dataset CAGRA build, isolating build overlap from
+transfer overlap.
 
 Eight chunks is the best requested fan-in in both environments. For cold local files it builds a
 validated final index in 81.305 s, 9.272 s or 10.2% less wall time than the true naive baseline.
@@ -26,6 +28,7 @@ validated.
 | cold local | pipelined + Fastener | 8 | **81.305 s [81.080, 81.530]** | **10.2%** |
 | paced network | naive pageable host | 1 | 117.126 s [115.032, 119.220] | baseline |
 | paced network | device prefetch | 1 | 110.266 s [110.191, 110.341] | 5.9% |
+| paced network | 8-chunk transfer pipeline + single build | 8 | 105.878 s [105.104, 106.651] | 9.6% |
 | paced network | pipelined + Fastener | 2 | 98.780 s [98.609, 98.952] | 15.7% |
 | paced network | pipelined + Fastener | 4 | 87.787 s [87.456, 88.117] | 25.0% |
 | paced network | pipelined + Fastener | 8 | **82.184 s [81.787, 82.580]** | **29.8%** |
@@ -36,7 +39,10 @@ validated.
 
 The one-chunk device path separates data movement improvements from splitting. It saves only
 1.852 s locally and 6.860 s under the network model. Relative to that stronger control, eight
-chunks saves 7.420 s (8.4%) locally and 28.083 s (25.5%) with paced download.
+chunks saves 7.420 s (8.4%) locally and 28.083 s (25.5%) with paced download. The eight-chunk
+transfer-only baseline takes 105.878 s: 11.248 s (9.6%) faster than naive, but 23.694 s slower
+than the fully pipelined eight-chunk path.
+
 ### One-chunk robustness
 
 The original 1.852 s local difference was based on two runs. Eight additional pairs were fixed in
@@ -101,21 +107,25 @@ sums deliberately exceed the critical path when work overlaps. "Hidden" is seria
 | cold local | 4 | — | 20.768 s | 68.819 s | 9.986 s | 15.700 s | 83.876 s |
 | cold local | 8 | — | 21.799 s | 68.731 s | 9.979 s | 19.207 s | 81.305 s |
 | paced network | 1 | 36.067 s | 4.995 s | 69.204 s | — | 0.001 s | 110.266 s |
+| paced network, 8-chunk transfer + single build | 8 | 36.067 s | 5.290 s | 69.156 s | — | 4.637 s | 105.878 s |
 | paced network | 2 | 36.068 s | 5.275 s | 68.173 s | 9.995 s | 20.733 s | 98.780 s |
 | paced network | 4 | 36.067 s | 5.643 s | 67.537 s | 9.983 s | 31.445 s | 87.787 s |
 | paced network | 8 | 36.067 s | 5.464 s | 67.087 s | 9.962 s | 36.399 s | 82.184 s |
 
 ![Cold-local component and overlap accounting](merge_api_results/plots/streaming_openai5m_local_overlap_20260709.png)
 
-The CAGRA build sum remains close to 67–70 s across the device paths, and every multi-part run adds
-about 10 s for Fastener. The speedup therefore comes primarily from scheduling:
+The CAGRA build sum remains close to 67–70 s across the device paths. The transfer-only baseline
+has no merge; each fully pipelined multi-part run adds about 10 s for Fastener. The speedup therefore comes primarily from scheduling:
 
 - locally, measured load/build intersection rises from 10.413 s at two chunks to 19.208 s at
   eight chunks;
 - at eight network chunks, download/build intersection is 30.933 s, load/build intersection is
   4.838 s, and download/load intersection is 4.793 s;
 - the first network build begins after about 4.5 s at eight chunks, instead of waiting 36.067 s
-  for the whole dataset.
+  for the whole dataset;
+- the transfer-only baseline hides 4.637 s by overlapping download with H2D, but has zero
+  download/build overlap; fully pipelining construction saves another 23.694 s despite its
+  9.962 s merge.
 
 The network eight-way mean is only 0.879 s slower than cold-local eight-way despite including a
 36.067 s transfer. This is not a storage-speed comparison: local inputs are explicitly cold, while
@@ -126,11 +136,12 @@ of the modeled transfer can leave the construction critical path.
 
 ![Paced-network eight-chunk pipeline](merge_api_results/plots/streaming_openai5m_pipeline_network_20260709.png)
 
-![Serialized versus pipelined network construction](merge_api_results/plots/streaming_openai5m_network_speedup_20260709.png)
+![Serialized, transfer-overlapped single-build, and pipelined construction](merge_api_results/plots/streaming_openai5m_network_speedup_20260709.png)
 
 The separate pipeline diagrams use the same representative retained trace without embedding a run
-identifier in their titles. The comparison places serialized download/load/build and the
-eight-chunk pipeline on the same scale. Per-part intervals are recorded directly. Each plot
+identifier in their titles. The comparison places serialized construction, eight-chunk transfer followed by one full build,
+and the eight-chunk construction pipeline on the same scale. Per-part intervals are recorded
+directly. Each plot
 positions the recorded merge duration so it ends at the end-to-end time; subsequent validity
 bookkeeping is below the visible resolution.
 
@@ -147,6 +158,16 @@ stops.
 The naive component's build interval includes work internal to the host-input library path, so its
 build sub-timing should not be compared directly with the explicitly instrumented H2D and
 device-input build intervals. Its end-to-end time is the intended comparison.
+
+### Transfer pipeline with one full build
+
+The `prefetch-single-build` path is a network-only eight-chunk control. It allocates one contiguous
+5,000,000 x 1,536 device matrix, loads each completed part directly into its final row range through
+the same pinned-buffer H2D engine, and starts no CAGRA work until all eight parts are resident. It
+then runs one device-input `cagra::build` with default graph parameters, attaches the
+already-prefetched matrix without another dataset copy, and performs no Fastener merge. Its zero
+download/build overlap distinguishes the benefit of transfer pipelining from the additional
+benefit of construction pipelining.
 
 ### Device-prefetch pipeline
 
@@ -181,7 +202,7 @@ direct device-to-device two-copy consolidation.
 | CPU / host RAM | Arm Neoverse-N1 / 250 GiB |
 | kernel | Linux 6.8.0-101-generic aarch64 |
 | source base | `5c4cb166d4d13e27fb4fc98c8483ec77bceb76df` |
-| repeats | two per mode/path/chunk count |
+| repeats | two per retained configuration |
 
 For local mode, one split set is first materialized under
 `/raid/blandrum/cuvs-streaming-openai5m-tmp`, `fdatasync` is applied, and the files are advised out
@@ -231,7 +252,7 @@ exact cumulative pacing, real buffered part files, and no network-mode cache evi
 
 The fan-in analysis rejects missing or duplicate configurations, wrong dataset shape, non-default
 graph degrees, a paced transfer more than 20 ms from target, malformed per-part layout, or any
-invalid final index. It validates 20 summary rows and 64 per-part rows. The paired analysis
+invalid final index. It validates 22 summary rows and 80 per-part rows. The paired analysis
 separately requires complete local naive/prefetch pairs numbered 1–10 and incorporates the 16
 additional valid rows from the robustness run.
 
@@ -264,8 +285,8 @@ python3 experiments/cpp/plot_streaming_openai5m.py
 python3 experiments/cpp/analyze_streaming_openai5m_onechunk.py
 ```
 
-The benchmark is available as the CMake target `CAGRA_STREAMING_BUILD_BENCH`. A representative
-network invocation is:
+The benchmark is available as the CMake target `CAGRA_STREAMING_BUILD_BENCH`. Representative fully
+pipelined and transfer-only baseline invocations are:
 
 ```bash
 CAGRA_STREAMING_BUILD_BENCH \
@@ -275,11 +296,20 @@ CAGRA_STREAMING_BUILD_BENCH \
   --parts-csv experiments/cpp/merge_api_results/streaming_openai5m_parts.csv \
   --mode network --build-path prefetch-device --parts 8 --run 1 \
   --network-seconds 36.067 --io-chunk-mib 64
+
+CAGRA_STREAMING_BUILD_BENCH \
+  --dataset /raid/blandrum/openai_5m/base.5M.fbin \
+  --temp-dir /raid/blandrum/cuvs-streaming-openai5m-tmp \
+  --summary-csv experiments/cpp/merge_api_results/streaming_openai5m_summary.csv \
+  --parts-csv experiments/cpp/merge_api_results/streaming_openai5m_parts.csv \
+  --mode network --build-path prefetch-single-build --parts 8 --run 1 \
+  --network-seconds 36.067 --io-chunk-mib 64
 ```
 
 ## Limitations
 
-- The 2/4/8-chunk fan-in points still have only two runs each, enough to establish the large trend
+- The 2/4/8-chunk fan-in points and transfer-only baseline have only two runs each, enough to
+  establish the large trend
   but not enough for formal variance estimates.
 - The local one-chunk comparison has 10 balanced pairs and formal paired inference, but its
   exploratory order effect shows sensitivity to short-term system state.

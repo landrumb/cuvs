@@ -4,9 +4,11 @@
  */
 
 #include <cuvs/neighbors/cagra.hpp>
+#include <cuvs/neighbors/nn_descent.hpp>
 #include <neighbors/detail/cagra/cagra_merge.cuh>
 
 #include "cagra_binary_cross_query_baseline.cuh"
+#include "kmeans_merge_scaffold.cuh"
 
 #include <raft/core/copy.hpp>
 #include <raft/core/device_mdarray.hpp>
@@ -53,6 +55,7 @@ struct options {
   std::string implementation;
   std::string serialized_index_dir;
   uint32_t parts = 2;
+  uint32_t rows = 0;
   int64_t topk = 12;
   std::size_t graph_degree = 64;
   std::size_t intermediate_graph_degree = 128;
@@ -62,6 +65,10 @@ struct options {
   int scaffold_first_repeat_neighbors = 0;
   uint64_t scaffold_seed = 1234;
   int64_t scaffold_candidate_cap = default_scaffold_candidate_cap;
+  int native_knn_degree = 32;
+  int kmeans_target_cluster_size = 256;
+  int kmeans_iterations = 20;
+  int kmeans_tree_branching = 2;
   std::vector<int> scaffold_candidate_cap_list;
   std::vector<int> scaffold_repeat_list;
   std::vector<int> scaffold_neighbor_list;
@@ -72,6 +79,7 @@ struct options {
   int64_t quality_sample_rows = 65536;
   int timing_runs = 2;
   bool deserialize_comparison = false;
+  bool owning_inputs = false;
   bool profile_merge = false;
 };
 
@@ -94,8 +102,9 @@ std::string usage() {
   --groundtruth <neighbors.ibin>
   --output-csv <results.csv>
   --label <dataset-label>
-  --implementation <rebuild|k4-scaffold|binary-cross-query>
+  --implementation <rebuild|k4-scaffold|ternary-scaffold|binary-cross-query|native-knn|flat-kmeans|kmeans-tree>
   [--parts <2|4|8|16|32|64|128>]
+  [--rows <dataset-prefix-rows; default: all>]
   [--graph-degree <int>]
   [--intermediate-graph-degree <int>]
   [--itopk-size <int>]
@@ -109,12 +118,17 @@ std::string usage() {
   [--scaffold-seed-list <comma-separated uint64 values>]
   [--scaffold-candidate-cap <0|at-least-output-degree> (default: output graph degree)]
   [--scaffold-candidate-cap-list <comma-separated ints>]
+  [--kmeans-target-cluster-size <positive int>]
+  [--kmeans-iterations <1-100>]
+  [--kmeans-tree-branching <2|5>]
+  [--native-knn-degree <12-128>]
   [--scaffold-repeat-sweep]
   [--scaffold-quality]
   [--quality-sample-rows <int>]
   [--deserialize-comparison]
   [--serialized-index-dir <empty-dir>]
   [--timing-runs <int>]
+  [--owning-inputs]
   [--profile-merge]
 )";
 }
@@ -195,6 +209,8 @@ options parse_args(int argc, char **argv) {
       opts.implementation = value();
     else if (arg == "--parts")
       opts.parts = static_cast<uint32_t>(parse_u64(value(), arg));
+    else if (arg == "--rows")
+      opts.rows = static_cast<uint32_t>(parse_u64(value(), arg));
     else if (arg == "--graph-degree")
       opts.graph_degree = parse_u64(value(), arg);
     else if (arg == "--intermediate-graph-degree") {
@@ -224,6 +240,15 @@ options parse_args(int argc, char **argv) {
           static_cast<int64_t>(parse_u64(value(), arg));
     } else if (arg == "--scaffold-candidate-cap-list") {
       opts.scaffold_candidate_cap_list = parse_repeat_list(value(), arg);
+    } else if (arg == "--native-knn-degree") {
+      opts.native_knn_degree = static_cast<int>(parse_u64(value(), arg));
+    } else if (arg == "--kmeans-target-cluster-size") {
+      opts.kmeans_target_cluster_size =
+          static_cast<int>(parse_u64(value(), arg));
+    } else if (arg == "--kmeans-iterations") {
+      opts.kmeans_iterations = static_cast<int>(parse_u64(value(), arg));
+    } else if (arg == "--kmeans-tree-branching") {
+      opts.kmeans_tree_branching = static_cast<int>(parse_u64(value(), arg));
     } else if (arg == "--scaffold-repeat-sweep") {
       opts.scaffold_repeat_sweep = true;
     } else if (arg == "--scaffold-quality") {
@@ -236,6 +261,8 @@ options parse_args(int argc, char **argv) {
       opts.serialized_index_dir = value();
     } else if (arg == "--timing-runs") {
       opts.timing_runs = static_cast<int>(parse_u64(value(), arg));
+    } else if (arg == "--owning-inputs") {
+      opts.owning_inputs = true;
     } else if (arg == "--profile-merge") {
       opts.profile_merge = true;
     } else if (arg == "--help" || arg == "-h") {
@@ -253,12 +280,39 @@ options parse_args(int argc, char **argv) {
   }
   if (opts.implementation != "rebuild" &&
       opts.implementation != "k4-scaffold" &&
-      opts.implementation != "binary-cross-query") {
+      opts.implementation != "ternary-scaffold" &&
+      opts.implementation != "binary-cross-query" &&
+      opts.implementation != "native-knn" &&
+      opts.implementation != "flat-kmeans" &&
+      opts.implementation != "kmeans-tree") {
     throw std::runtime_error("Unknown --implementation: " +
                              opts.implementation);
   }
   if (opts.parts < 2) {
     throw std::runtime_error("--parts must be >= 2");
+  }
+  if (opts.native_knn_degree < 12 || opts.native_knn_degree > 128) {
+    throw std::runtime_error("--native-knn-degree must be in [12, 128]");
+  }
+  if (opts.implementation == "native-knn" && opts.owning_inputs) {
+    if ((opts.implementation == "flat-kmeans" ||
+         opts.implementation == "kmeans-tree") &&
+        opts.owning_inputs) {
+      throw std::runtime_error(
+          "K-means scaffold variants require reusable non-owning inputs");
+    }
+    if (opts.kmeans_target_cluster_size < 2) {
+      throw std::runtime_error(
+          "--kmeans-target-cluster-size must be at least 2");
+    }
+    if (opts.kmeans_iterations < 1 || opts.kmeans_iterations > 100) {
+      throw std::runtime_error("--kmeans-iterations must be in [1, 100]");
+    }
+    if (opts.kmeans_tree_branching != 2 && opts.kmeans_tree_branching != 5) {
+      throw std::runtime_error("--kmeans-tree-branching must be 2 or 5");
+    }
+    throw std::runtime_error(
+        "--native-knn requires reusable non-owning inputs");
   }
   if (opts.intermediate_graph_degree < opts.graph_degree) {
     throw std::runtime_error(
@@ -425,6 +479,15 @@ options parse_args(int argc, char **argv) {
     throw std::runtime_error("--deserialize-comparison cannot be combined with "
                              "sweep, quality, or profiling modes");
   }
+  if (opts.owning_inputs &&
+      (opts.scaffold_repeat_sweep || !opts.scaffold_repeat_list.empty() ||
+       !opts.scaffold_neighbor_list.empty() ||
+       !opts.scaffold_first_repeat_neighbor_list.empty() ||
+       !opts.scaffold_candidate_cap_list.empty() ||
+       !opts.scaffold_seed_list.empty())) {
+    throw std::runtime_error(
+        "--owning-inputs cannot be reused by a parameter sweep");
+  }
   return opts;
 }
 
@@ -450,22 +513,28 @@ void read_large(std::istream &in, char *dst, std::size_t bytes,
   }
 }
 
-template <typename T> bin_matrix<T> read_bin(std::string const &path) {
+template <typename T>
+bin_matrix<T> read_bin(std::string const &path, uint32_t max_rows = 0) {
   std::ifstream in(path, std::ios::binary);
   if (!in) {
     throw std::runtime_error("Could not open " + path);
   }
   bin_matrix<T> matrix;
-  read_exact(in, reinterpret_cast<char *>(&matrix.rows), sizeof(matrix.rows),
-             path);
+  uint32_t file_rows = 0;
+  read_exact(in, reinterpret_cast<char *>(&file_rows), sizeof(file_rows), path);
   read_exact(in, reinterpret_cast<char *>(&matrix.dim), sizeof(matrix.dim),
              path);
-  auto count = static_cast<std::size_t>(matrix.rows) * matrix.dim;
-  auto expected = 2 * sizeof(uint32_t) + count * sizeof(T);
+  auto file_count = static_cast<std::size_t>(file_rows) * matrix.dim;
+  auto expected = 2 * sizeof(uint32_t) + file_count * sizeof(T);
   if (std::filesystem::file_size(path) != expected) {
     throw std::runtime_error("Payload size does not match selected datatype: " +
                              path);
   }
+  if (max_rows > file_rows) {
+    throw std::runtime_error("Requested --rows exceeds dataset rows");
+  }
+  matrix.rows = max_rows == 0 ? file_rows : max_rows;
+  auto count = static_cast<std::size_t>(matrix.rows) * matrix.dim;
   matrix.data.resize(count);
   read_large(in, reinterpret_cast<char *>(matrix.data.data()),
              count * sizeof(T), path);
@@ -633,8 +702,171 @@ void append_deserialize_result(options const &opts, char const *dtype,
       << end_to_end_ms << ',' << deserialize_pct << ',' << merge_pct << '\n';
 }
 
+__device__ int native_partition_of(uint32_t row, int64_t rows, uint32_t parts) {
+  int64_t base = rows / parts;
+  int64_t remainder = rows % parts;
+  int64_t wide_rows = remainder * (base + 1);
+  if (static_cast<int64_t>(row) < wide_rows) {
+    return static_cast<int>(row / (base + 1));
+  }
+  return static_cast<int>(remainder + (row - wide_rows) / base);
+}
+
+__device__ uint32_t native_partition_start(int part, int64_t rows,
+                                           uint32_t parts) {
+  int64_t base = rows / parts;
+  int64_t remainder = rows % parts;
+  if (part < remainder) {
+    return static_cast<uint32_t>(part * (base + 1));
+  }
+  return static_cast<uint32_t>(remainder * (base + 1) +
+                               (part - remainder) * base);
+}
+
+static __global__ void
+filter_native_cross_partition_kernel(uint32_t const *input, int64_t rows,
+                                     int degree, uint32_t parts,
+                                     uint32_t *output) {
+  int64_t row = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (row >= rows) {
+    return;
+  }
+  int origin = native_partition_of(static_cast<uint32_t>(row), rows, parts);
+  int selected = 0;
+  for (int j = 0; j < degree; ++j) {
+    uint32_t candidate = input[row * degree + j];
+    if (candidate < rows && candidate != row &&
+        native_partition_of(candidate, rows, parts) != origin) {
+      output[row * degree + selected++] = candidate;
+    }
+  }
+
+  int fallback_part = (origin + 1) % parts;
+  uint32_t fallback = native_partition_start(fallback_part, rows, parts);
+  uint32_t fallback_end =
+      native_partition_start(fallback_part + 1, rows, parts);
+  if (fallback_part + 1 == parts) {
+    fallback_end = static_cast<uint32_t>(rows);
+  }
+  uint32_t fallback_size = fallback_end - fallback;
+  for (int j = selected; j < degree; ++j) {
+    output[row * degree + j] = fallback + ((j - selected) % fallback_size);
+  }
+}
+
+template <typename T>
+auto merge_with_native_knn(
+    raft::resources const &res,
+    cuvs::neighbors::cagra::index_params const &params,
+    std::vector<cuvs::neighbors::cagra::index<T, uint32_t> *> const &indices,
+    raft::device_matrix_view<const T, int64_t, raft::row_major> dataset,
+    uint32_t parts, int native_degree)
+    -> cuvs::neighbors::cagra::index<T, uint32_t> {
+  auto stream = raft::resource::get_cuda_stream(res);
+  cuvs::neighbors::nn_descent::index_params nn_params(native_degree,
+                                                      params.metric);
+  nn_params.intermediate_graph_degree =
+      std::max<std::size_t>(2 * native_degree, 64);
+  nn_params.return_distances = false;
+  auto native_index =
+      cuvs::neighbors::nn_descent::build(res, nn_params, dataset);
+
+  auto native_graph = raft::make_device_matrix<uint32_t, int64_t>(
+      res, dataset.extent(0), native_degree);
+  raft::copy(native_graph.data_handle(), native_index.graph().data_handle(),
+             native_graph.size(), stream);
+  auto cross_graph = raft::make_device_matrix<uint32_t, int64_t>(
+      res, dataset.extent(0), native_degree);
+  int blocks = static_cast<int>((dataset.extent(0) + 255) / 256);
+  filter_native_cross_partition_kernel<<<blocks, 256, 0, stream>>>(
+      native_graph.data_handle(), dataset.extent(0), native_degree, parts,
+      cross_graph.data_handle());
+  RAFT_CUDA_TRY(cudaGetLastError());
+
+  std::vector<int64_t> offsets{0};
+  int64_t base = dataset.extent(0) / parts;
+  int64_t remainder = dataset.extent(0) % parts;
+  for (uint32_t part = 0; part < parts; ++part) {
+    offsets.push_back(offsets.back() + base + (part < remainder ? 1 : 0));
+  }
+  auto merged_graph =
+      cuvs::neighbors::cagra::detail::merge_scaffold::append_to_input_graphs<
+          T, uint32_t>(res, indices, offsets,
+                       raft::make_const_mdspan(cross_graph.view()));
+  cuvs::neighbors::cagra::detail::graph::sort_knn_graph_device_inplace(
+      res, params.metric, dataset, merged_graph.view());
+  if (merged_graph.extent(1) > static_cast<int64_t>(params.graph_degree)) {
+    merged_graph =
+        cuvs::neighbors::cagra::detail::merge_scaffold::cap_sorted_graph(
+            res, raft::make_const_mdspan(merged_graph.view()),
+            params.graph_degree);
+  }
+
+  auto optimized_graph = raft::make_device_matrix<uint32_t, int64_t>(
+      res, dataset.extent(0), static_cast<int64_t>(params.graph_degree));
+  cuvs::neighbors::cagra::detail::graph::optimize(
+      res, merged_graph.view(), optimized_graph.view(),
+      params.guarantee_connectivity);
+  cuvs::neighbors::cagra::index<T, uint32_t> merged(res, params.metric);
+  merged.update_graph(res, std::move(optimized_graph));
+  merged.update_dataset(res, dataset);
+  raft::resource::sync_stream(res);
+  return merged;
+}
+
+template <typename T>
+auto merge_with_kmeans_scaffold(
+    raft::resources const &res,
+    cuvs::neighbors::cagra::index_params const &params,
+    std::vector<cuvs::neighbors::cagra::index<T, uint32_t> *> const &indices,
+    raft::device_matrix_view<const T, int64_t, raft::row_major> dataset,
+    options const &opts) -> cuvs::neighbors::cagra::index<T, uint32_t> {
+  std::vector<int64_t> offsets{0};
+  for (auto const *index : indices) {
+    offsets.push_back(offsets.back() + static_cast<int64_t>(index->size()));
+  }
+  RAFT_EXPECTS(offsets.back() == dataset.extent(0),
+               "K-means scaffold offsets do not cover the dataset");
+
+  auto layout =
+      opts.implementation == "flat-kmeans"
+          ? fastener_experiment::kmeans_scaffold::flat_balanced(
+                res, dataset, opts.kmeans_target_cluster_size,
+                opts.kmeans_iterations)
+          : fastener_experiment::kmeans_scaffold::lloyd_tree(
+                res, dataset, opts.kmeans_tree_branching,
+                cuvs::neighbors::cagra::detail::merge_scaffold::k_cluster_size,
+                opts.kmeans_iterations);
+  std::cout << "kmeans scaffold clusters=" << layout.clusters.size()
+            << " mode=" << opts.implementation << '\n';
+  auto scaffold = fastener_experiment::kmeans_scaffold::build_graph(
+      res, dataset, offsets, layout, 4);
+  auto merged_graph =
+      cuvs::neighbors::cagra::detail::merge_scaffold::append_to_input_graphs<
+          T, uint32_t>(res, indices, offsets,
+                       raft::make_const_mdspan(scaffold.view()));
+  cuvs::neighbors::cagra::detail::graph::sort_knn_graph_device_inplace(
+      res, params.metric, dataset, merged_graph.view());
+  if (merged_graph.extent(1) > static_cast<int64_t>(params.graph_degree)) {
+    merged_graph =
+        cuvs::neighbors::cagra::detail::merge_scaffold::cap_sorted_graph(
+            res, raft::make_const_mdspan(merged_graph.view()),
+            params.graph_degree);
+  }
+
+  auto optimized_graph = raft::make_device_matrix<uint32_t, int64_t>(
+      res, dataset.extent(0), static_cast<int64_t>(params.graph_degree));
+  cuvs::neighbors::cagra::detail::graph::optimize(
+      res, merged_graph.view(), optimized_graph.view(),
+      params.guarantee_connectivity);
+  cuvs::neighbors::cagra::index<T, uint32_t> merged(res, params.metric);
+  merged.update_graph(res, std::move(optimized_graph));
+  merged.update_dataset(res, dataset);
+  raft::resource::sync_stream(res);
+  return merged;
+}
 template <typename T> int run(options const &opts) {
-  auto dataset = read_bin<T>(opts.dataset);
+  auto dataset = read_bin<T>(opts.dataset, opts.rows);
   auto queries = read_bin<T>(opts.queries);
   auto groundtruth = read_ibin(opts.groundtruth);
   if (dataset.dim != queries.dim) {
@@ -648,6 +880,18 @@ template <typename T> int run(options const &opts) {
   }
 
   raft::resources res;
+  // Keep one device-resident dataset and attach non-owning slices to every
+  // partition index. Fastener consumes owning input datasets after a
+  // successful merge, while parameter sweeps intentionally reuse the same
+  // partition graphs for several independent merge configurations.
+  auto device_dataset = raft::make_device_matrix<T, int64_t>(
+      res, opts.owning_inputs ? 0 : dataset.rows, dataset.dim);
+  if (!opts.owning_inputs) {
+    raft::copy(device_dataset.data_handle(), dataset.data.data(),
+               dataset.data.size(), raft::resource::get_cuda_stream(res));
+  }
+  raft::resource::sync_stream(res);
+
   std::vector<cuvs::neighbors::cagra::index<T, uint32_t>> owned_indices;
   std::vector<cuvs::neighbors::cagra::index<T, uint32_t> *> indices;
   owned_indices.reserve(opts.parts);
@@ -659,21 +903,31 @@ template <typename T> int run(options const &opts) {
   auto oracle_start = clock_type::now();
   for (uint32_t part = 0; part < opts.parts; ++part) {
     uint32_t part_rows = base_rows + (part < remainder ? 1 : 0);
-    auto view = raft::make_host_matrix_view<const T, int64_t>(
-        dataset.data.data() + static_cast<std::size_t>(offset) * dataset.dim,
-        part_rows, dataset.dim);
     cuvs::neighbors::cagra::index_params build_params;
     build_params.metric = cuvs::distance::DistanceType::L2Expanded;
     build_params.graph_degree = opts.graph_degree;
     build_params.intermediate_graph_degree = opts.intermediate_graph_degree;
-    build_params.attach_dataset_on_build = true;
+    build_params.attach_dataset_on_build = opts.owning_inputs;
     build_params.guarantee_connectivity = false;
     build_params.graph_build_params =
         cuvs::neighbors::cagra::graph_build_params::ivf_pq_params(
             raft::matrix_extent<int64_t>(part_rows, dataset.dim),
             build_params.metric);
-    owned_indices.push_back(
-        cuvs::neighbors::cagra::build(res, build_params, view));
+    if (opts.owning_inputs) {
+      auto view = raft::make_host_matrix_view<const T, int64_t>(
+          dataset.data.data() + static_cast<std::size_t>(offset) * dataset.dim,
+          part_rows, dataset.dim);
+      owned_indices.push_back(
+          cuvs::neighbors::cagra::build(res, build_params, view));
+    } else {
+      auto view = raft::make_device_matrix_view<const T, int64_t>(
+          device_dataset.data_handle() +
+              static_cast<std::size_t>(offset) * dataset.dim,
+          part_rows, dataset.dim);
+      owned_indices.push_back(
+          cuvs::neighbors::cagra::build(res, build_params, view));
+      owned_indices.back().update_dataset(res, view);
+    }
     indices.push_back(&owned_indices.back());
     offset += part_rows;
     std::cout << "oracle part " << part << " rows=" << part_rows << " built\n";
@@ -916,9 +1170,24 @@ template <typename T> int run(options const &opts) {
         return cuvs::neighbors::cagra::detail::binary_cross_query::merge_tree(
             res, merge_params, std::move(owned_indices));
       }
+      if (opts.implementation == "native-knn") {
+        return merge_with_native_knn<T>(
+            res, merge_params, indices,
+            raft::make_const_mdspan(device_dataset.view()), opts.parts,
+            opts.native_knn_degree);
+      }
+      if (opts.implementation == "flat-kmeans" ||
+          opts.implementation == "kmeans-tree") {
+        return merge_with_kmeans_scaffold<T>(
+            res, merge_params, indices,
+            raft::make_const_mdspan(device_dataset.view()), opts);
+      }
+
       cuvs::neighbors::cagra::detail::merge_scaffold::build_params
           scaffold_params;
       scaffold_params.repeats = scaffold_repeats;
+      scaffold_params.pivot_arity =
+          opts.implementation == "ternary-scaffold" ? 3 : 2;
       scaffold_params.neighbors_per_leaf = scaffold_neighbors;
       scaffold_params.first_repeat_neighbors_per_leaf =
           scaffold_first_neighbors;
@@ -983,6 +1252,22 @@ template <typename T> int run(options const &opts) {
     }
     if (opts.implementation == "k4-scaffold" && scaffold_cap > 0) {
       result_opts.implementation += "-cap" + std::to_string(scaffold_cap);
+    }
+    if (opts.implementation == "native-knn") {
+      result_opts.implementation +=
+          "-k" + std::to_string(opts.native_knn_degree);
+    }
+    if (opts.implementation == "flat-kmeans") {
+      result_opts.implementation +=
+          "-target" + std::to_string(opts.kmeans_target_cluster_size) +
+          "-iter" + std::to_string(opts.kmeans_iterations) + "-k4-cap64";
+    }
+    if (opts.implementation == "kmeans-tree") {
+      result_opts.implementation +=
+          "-b" + std::to_string(opts.kmeans_tree_branching) + "-leaf" +
+          std::to_string(
+              cuvs::neighbors::cagra::detail::merge_scaffold::k_cluster_size) +
+          "-iter" + std::to_string(opts.kmeans_iterations) + "-k4-cap64";
     }
     if (opts.scaffold_quality) {
       append_quality_result(

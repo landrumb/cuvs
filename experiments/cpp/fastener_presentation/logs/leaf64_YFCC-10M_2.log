@@ -1,0 +1,3 @@
+oracle part 0 rows=5000000 built
+oracle part 1 rows=5000000 built
+RESULT dataset=YFCC-10M parts=2 implementation=k4-scaffold-cap64 merge_ms=4117.08 search_ms=294.774 recall=0.986804 qps=339242 scaffold_neighbors=4 scaffold_first_neighbors=4 scaffold_seed=1234 candidate_cap=64

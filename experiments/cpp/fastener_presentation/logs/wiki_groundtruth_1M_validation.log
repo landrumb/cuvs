@@ -1,0 +1,30 @@
+rows=1000000: exact query kNN 512/10000 (19.5s)
+rows=1000000: exact query kNN 1024/10000 (19.6s)
+rows=1000000: exact query kNN 1536/10000 (19.7s)
+rows=1000000: exact query kNN 2048/10000 (19.8s)
+rows=1000000: exact query kNN 2560/10000 (20.0s)
+rows=1000000: exact query kNN 3072/10000 (20.1s)
+rows=1000000: exact query kNN 3584/10000 (20.2s)
+rows=1000000: exact query kNN 4096/10000 (20.3s)
+rows=1000000: exact query kNN 4608/10000 (20.5s)
+rows=1000000: exact query kNN 5120/10000 (20.6s)
+rows=1000000: exact query kNN 5632/10000 (20.7s)
+rows=1000000: exact query kNN 6144/10000 (20.8s)
+rows=1000000: exact query kNN 6656/10000 (20.9s)
+rows=1000000: exact query kNN 7168/10000 (21.1s)
+rows=1000000: exact query kNN 7680/10000 (21.2s)
+rows=1000000: exact query kNN 8192/10000 (21.3s)
+rows=1000000: exact query kNN 8704/10000 (21.4s)
+rows=1000000: exact query kNN 9216/10000 (21.5s)
+rows=1000000: exact query kNN 9728/10000 (21.7s)
+rows=1000000: exact query kNN 10000/10000 (21.8s)
+wrote /home/coder/cuvs-fastener-device-memory/experiments/cpp/fastener_presentation/groundtruth/wiki_prefix_1M_validation_neighbors.json
+{
+  "exact_position_fraction": 0.9997416666666666,
+  "exact_set_row_fraction": 0.9997,
+  "generated": "/home/coder/cuvs-fastener-device-memory/experiments/cpp/fastener_presentation/groundtruth/wiki_prefix_1M_validation_neighbors.ibin",
+  "k": 12,
+  "mean_set_recall": 0.999975,
+  "reference": "/raid/blandrum/local_datasets/wiki_all_1M/groundtruth.1M.neighbors.ibin",
+  "rows": 10000
+}

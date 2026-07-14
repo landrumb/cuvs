@@ -1,0 +1,8 @@
+oracle part 0 rows=500000 built
+oracle part 1 rows=500000 built
+RESULT dataset=Wiki-1M parts=2 implementation=k4-scaffold-repeat1-cap64 merge_ms=297.499 search_ms=145.626 recall=0.992008 qps=68669.1 scaffold_neighbors=4 scaffold_first_neighbors=4 scaffold_seed=1234 candidate_cap=64
+RESULT dataset=Wiki-1M parts=2 implementation=k4-scaffold-repeat2-cap64 merge_ms=413.204 search_ms=145.821 recall=0.99275 qps=68577.2 scaffold_neighbors=4 scaffold_first_neighbors=4 scaffold_seed=1234 candidate_cap=64
+RESULT dataset=Wiki-1M parts=2 implementation=k4-scaffold-repeat4-cap64 merge_ms=627.543 search_ms=146.091 recall=0.993575 qps=68450.4 scaffold_neighbors=4 scaffold_first_neighbors=4 scaffold_seed=1234 candidate_cap=64
+RESULT dataset=Wiki-1M parts=2 implementation=k4-scaffold-repeat8-cap64 merge_ms=1058.89 search_ms=144.37 recall=0.994267 qps=69266.7 scaffold_neighbors=4 scaffold_first_neighbors=4 scaffold_seed=1234 candidate_cap=64
+RESULT dataset=Wiki-1M parts=2 implementation=k4-scaffold-repeat16-cap64 merge_ms=1931.63 search_ms=143.93 recall=0.994975 qps=69478.2 scaffold_neighbors=4 scaffold_first_neighbors=4 scaffold_seed=1234 candidate_cap=64
+RESULT dataset=Wiki-1M parts=2 implementation=k4-scaffold-repeat32-cap64 merge_ms=3674.4 search_ms=142.629 recall=0.994717 qps=70112 scaffold_neighbors=4 scaffold_first_neighbors=4 scaffold_seed=1234 candidate_cap=64

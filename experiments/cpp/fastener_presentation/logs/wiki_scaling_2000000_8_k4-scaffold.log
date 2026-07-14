@@ -1,0 +1,9 @@
+oracle part 0 rows=250000 built
+oracle part 1 rows=250000 built
+oracle part 2 rows=250000 built
+oracle part 3 rows=250000 built
+oracle part 4 rows=250000 built
+oracle part 5 rows=250000 built
+oracle part 6 rows=250000 built
+oracle part 7 rows=250000 built
+RESULT dataset=Wiki-10M-prefix parts=8 implementation=k4-scaffold-cap64 merge_ms=2183.53 search_ms=150.028 recall=0.989642 qps=66654.2 scaffold_neighbors=4 scaffold_first_neighbors=4 scaffold_seed=1234 candidate_cap=64

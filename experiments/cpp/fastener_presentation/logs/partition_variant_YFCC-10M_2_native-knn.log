@@ -1,0 +1,3 @@
+oracle part 0 rows=5000000 built
+oracle part 1 rows=5000000 built
+RESULT dataset=YFCC-10M parts=2 implementation=native-knn-k32 merge_ms=48948.3 search_ms=292.443 recall=0.991306 qps=341947 scaffold_neighbors=4 scaffold_first_neighbors=4 scaffold_seed=1234 candidate_cap=64

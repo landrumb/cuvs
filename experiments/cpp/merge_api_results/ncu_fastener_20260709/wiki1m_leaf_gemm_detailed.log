@@ -1,0 +1,4 @@
+==PROF== Connected to process 3966236 (/home/coder/cuvs-fastener-device-memory/experiments/cpp/build-ncu/CAGRA_MERGE_API_BENCH)
+==PROF== Profiling "sm80_xmma_gemm_f32f32_f32f32_f32_tn_n_tilesize256x64x8_stage3_warpsize2x2x1_ffma_aligna4_alignc4_execute_kernel__5x_cublas": 0%....50%....100% - 20 passes
+==PROF== Disconnected from process 3966236
+==PROF== Report: /home/coder/cuvs-fastener-device-memory/experiments/cpp/merge_api_results/ncu_fastener_20260709/wiki1m_leaf_gemm_detailed.ncu-rep

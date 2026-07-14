@@ -1,0 +1,13 @@
+oracle part 0 rows=1250000 built
+oracle part 1 rows=1250000 built
+oracle part 2 rows=1250000 built
+oracle part 3 rows=1250000 built
+oracle part 4 rows=1250000 built
+oracle part 5 rows=1250000 built
+oracle part 6 rows=1250000 built
+oracle part 7 rows=1250000 built
+RESULT dataset=YFCC-10M parts=8 implementation=k4-scaffold-k1-cap64 merge_ms=2392.24 search_ms=298.226 recall=0.977337 qps=335316 scaffold_neighbors=1 scaffold_first_neighbors=1 scaffold_seed=1234 candidate_cap=64
+RESULT dataset=YFCC-10M parts=8 implementation=k4-scaffold-k2-cap64 merge_ms=2438.33 search_ms=300.435 recall=0.979774 qps=332851 scaffold_neighbors=2 scaffold_first_neighbors=2 scaffold_seed=1234 candidate_cap=64
+RESULT dataset=YFCC-10M parts=8 implementation=k4-scaffold-cap64 merge_ms=2550.19 search_ms=299.576 recall=0.981045 qps=333805 scaffold_neighbors=4 scaffold_first_neighbors=4 scaffold_seed=1234 candidate_cap=64
+RESULT dataset=YFCC-10M parts=8 implementation=k4-scaffold-k8-cap64 merge_ms=2926.16 search_ms=299.693 recall=0.981413 qps=333675 scaffold_neighbors=8 scaffold_first_neighbors=8 scaffold_seed=1234 candidate_cap=64
+RESULT dataset=YFCC-10M parts=8 implementation=k4-scaffold-k16-cap64 merge_ms=4245.88 search_ms=299.064 recall=0.981023 qps=334377 scaffold_neighbors=16 scaffold_first_neighbors=16 scaffold_seed=1234 candidate_cap=64

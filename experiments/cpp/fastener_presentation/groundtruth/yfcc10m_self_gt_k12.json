@@ -1,0 +1,22 @@
+{
+  "batch_size": 32,
+  "dataset": "/raid/blandrum/yfcc/base.10M.u8bin",
+  "dataset_rows": 10000000,
+  "dimension": 192,
+  "distance_dtype": "float32",
+  "distances": "yfcc10m_self_gt_k12_distances.fbin",
+  "distances_sha256": "c1b8297d91b347354fb0620c18581f1ffb6ffafda9f4253f6325997036cda956",
+  "k": 12,
+  "method": "exact exhaustive squared-L2 GPU search",
+  "neighbors": "yfcc10m_self_gt_k12.ibin",
+  "neighbors_sha256": "13316def1a2b704d9b2e158798d027d328053e8d8356d8e07dbdd08529f8e1a6",
+  "sample_ids": "yfcc10m_sample_ids.ibin",
+  "sample_ids_sha256": "b57fb46f08e7646b761176b073a4471ce7649bf1199334763ff9e5eb35e2129f",
+  "sample_size": 4096,
+  "search_seconds": 8.726207280065864,
+  "seed": 20260709,
+  "self_edges_excluded": true,
+  "source_dtype": "uint8",
+  "tf32_enabled": false,
+  "upload_seconds": 5.733281139284372
+}

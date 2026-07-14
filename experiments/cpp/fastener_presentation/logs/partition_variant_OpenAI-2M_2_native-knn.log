@@ -1,0 +1,3 @@
+oracle part 0 rows=1160548 built
+oracle part 1 rows=1160548 built
+RESULT dataset=OpenAI-2M parts=2 implementation=native-knn-k32 merge_ms=21472.4 search_ms=587.781 recall=0.972004 qps=34026.3 scaffold_neighbors=4 scaffold_first_neighbors=4 scaffold_seed=1234 candidate_cap=64

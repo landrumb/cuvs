@@ -1,0 +1,9 @@
+oracle part 0 rows=125000 built
+oracle part 1 rows=125000 built
+oracle part 2 rows=125000 built
+oracle part 3 rows=125000 built
+oracle part 4 rows=125000 built
+oracle part 5 rows=125000 built
+oracle part 6 rows=125000 built
+oracle part 7 rows=125000 built
+RESULT dataset=Wiki-1M parts=8 implementation=ternary-scaffold merge_ms=1481.3 search_ms=145.856 recall=0.992667 qps=68560.6 scaffold_neighbors=4 scaffold_first_neighbors=4 scaffold_seed=1234 candidate_cap=64

@@ -1,0 +1,22 @@
+{
+  "batch_size": 32,
+  "dataset": "/raid/blandrum/openai/openai_base.bin",
+  "dataset_rows": 2321096,
+  "dimension": 1536,
+  "distance_dtype": "float32",
+  "distances": "openai2m_self_gt_k12_distances.fbin",
+  "distances_sha256": "cd9c3d3578e704964564855aae9a02b64f053a27d5fd396eee8dfcb3692188ea",
+  "k": 12,
+  "method": "exact exhaustive squared-L2 GPU search",
+  "neighbors": "openai2m_self_gt_k12.ibin",
+  "neighbors_sha256": "2d39421b165b007aab30cfe5ab5742eaed4fb2420103583bb45b75b13c0bde9f",
+  "sample_ids": "openai2m_sample_ids.ibin",
+  "sample_ids_sha256": "268057b084607ef8d88651d89011e116a3ac4c9b46cc68521f6f6856d8d67df7",
+  "sample_size": 4096,
+  "search_seconds": 3.922843439038843,
+  "seed": 20260709,
+  "self_edges_excluded": true,
+  "source_dtype": "float32",
+  "tf32_enabled": false,
+  "upload_seconds": 10.147822821047157
+}

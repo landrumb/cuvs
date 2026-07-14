@@ -1,0 +1,20 @@
+oracle part 0 rows=290137 built
+oracle part 1 rows=290137 built
+oracle part 2 rows=290137 built
+oracle part 3 rows=290137 built
+oracle part 4 rows=290137 built
+oracle part 5 rows=290137 built
+oracle part 6 rows=290137 built
+oracle part 7 rows=290137 built
+kmeans scaffold clusters=7499 mode=flat-kmeans
+RESULT dataset=OpenAI-2M parts=8 implementation=flat-kmeans-target256-iter1-k4-cap64 merge_ms=122957 search_ms=608.238 recall=0.9427 qps=32881.9 scaffold_neighbors=4 scaffold_first_neighbors=4 scaffold_seed=1234 candidate_cap=64
+oracle part 0 rows=290137 built
+oracle part 1 rows=290137 built
+oracle part 2 rows=290137 built
+oracle part 3 rows=290137 built
+oracle part 4 rows=290137 built
+oracle part 5 rows=290137 built
+oracle part 6 rows=290137 built
+oracle part 7 rows=290137 built
+kmeans scaffold clusters=7499 mode=flat-kmeans
+RESULT dataset=OpenAI-2M parts=8 implementation=flat-kmeans-target256-iter1-k4-cap64 merge_ms=123337 search_ms=607.52 recall=0.942142 qps=32920.7 scaffold_neighbors=4 scaffold_first_neighbors=4 scaffold_seed=1234 candidate_cap=64

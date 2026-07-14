@@ -18,6 +18,7 @@ rapids_cuda_init_architectures(cuvs_experiments)
 project(cuvs_experiments LANGUAGES CXX CUDA)
 
 rapids_cpm_init()
+include(../../cpp/cmake/thirdparty/get_cutlass.cmake)
 set(BUILD_CUVS_C_LIBRARY OFF)
 include(../cmake/thirdparty/get_cuvs.cmake)
 
@@ -45,7 +46,8 @@ target_link_libraries(
   CAGRA_SPLIT_MERGE_CONSTRUCTION PRIVATE cuvs::cuvs $<TARGET_NAME_IF_EXISTS:conda_env>
 )
 
-add_executable(CAGRA_MERGE_API_BENCH src/cagra_merge_api_bench.cu)
+add_executable(
+  CAGRA_MERGE_API_BENCH src/cagra_merge_api_bench.cu src/kmeans_min_cluster_fused.cu)
 target_include_directories(
   CAGRA_MERGE_API_BENCH
   PRIVATE
@@ -57,7 +59,59 @@ set_target_properties(
 )
 target_link_libraries(
   CAGRA_MERGE_API_BENCH
-  PRIVATE cuvs::cuvs CUDA::cuda_driver $<TARGET_NAME_IF_EXISTS:conda_env>
+  PRIVATE
+    cuvs::cuvs
+    CUDA::cuda_driver
+    nvidia::cutlass::cutlass
+    $<TARGET_NAME_IF_EXISTS:conda_env>
+)
+
+foreach(leaf_size IN ITEMS 64 128 256 512)
+  set(target CAGRA_MERGE_API_BENCH_LEAF_${leaf_size})
+  add_executable(
+    ${target} src/cagra_merge_api_bench.cu src/kmeans_min_cluster_fused.cu)
+  target_include_directories(
+    ${target}
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/../../cpp/include
+      ${CMAKE_CURRENT_SOURCE_DIR}/../../cpp/src
+  )
+  target_compile_definitions(
+    ${target} PRIVATE CUVS_MERGE_SCAFFOLD_CLUSTER_SIZE=${leaf_size}
+  )
+  set_target_properties(
+    ${target}
+    PROPERTIES CXX_STANDARD 20 CUDA_STANDARD 20 OUTPUT_NAME cagra_merge_api_bench_leaf_${leaf_size}
+  )
+  target_link_libraries(
+    ${target}
+    PRIVATE
+      cuvs::cuvs
+      CUDA::cuda_driver
+      nvidia::cutlass::cutlass
+      $<TARGET_NAME_IF_EXISTS:conda_env>
+  )
+endforeach()
+
+add_executable(
+  CAGRA_PARTITION_QUALITY_BENCH
+  src/cagra_partition_quality_bench.cu src/kmeans_min_cluster_fused.cu)
+target_include_directories(
+  CAGRA_PARTITION_QUALITY_BENCH
+  PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../cpp/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../cpp/src
+)
+set_target_properties(
+  CAGRA_PARTITION_QUALITY_BENCH PROPERTIES CXX_STANDARD 20 CUDA_STANDARD 20
+)
+target_link_libraries(
+  CAGRA_PARTITION_QUALITY_BENCH
+  PRIVATE
+    cuvs::cuvs
+    CUDA::cuda_driver
+    nvidia::cutlass::cutlass
+    $<TARGET_NAME_IF_EXISTS:conda_env>
 )
 
 add_executable(CAGRA_STREAMING_BUILD_BENCH src/cagra_streaming_build_bench.cu)

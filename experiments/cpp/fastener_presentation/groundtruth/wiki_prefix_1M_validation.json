@@ -1,0 +1,9 @@
+{
+  "exact_position_fraction": 0.9997416666666666,
+  "exact_set_row_fraction": 0.9997,
+  "generated": "/home/coder/cuvs-fastener-device-memory/experiments/cpp/fastener_presentation/groundtruth/wiki_prefix_1M_validation_neighbors.ibin",
+  "k": 12,
+  "mean_set_recall": 0.999975,
+  "reference": "/raid/blandrum/local_datasets/wiki_all_1M/groundtruth.1M.neighbors.ibin",
+  "rows": 10000
+}

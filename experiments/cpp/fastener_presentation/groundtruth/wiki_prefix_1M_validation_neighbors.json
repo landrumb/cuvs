@@ -1,0 +1,21 @@
+{
+  "batch_size": 32,
+  "dataset": "/raid/blandrum/local_datasets/wiki_all_10M/base.10M.fbin",
+  "dataset_dtype": "float32",
+  "dataset_file_rows": 10000000,
+  "dimension": 768,
+  "distance_dtype": "float32",
+  "distances": "wiki_prefix_1M_validation_neighbors_distances.fbin",
+  "distances_sha256": "8d7c49b4c37aedc3692c0df40e7d44a6ff8801dc05442c63160dd1865765d2bc",
+  "k": 12,
+  "method": "exact exhaustive squared-L2 GPU search",
+  "neighbors": "wiki_prefix_1M_validation_neighbors.ibin",
+  "neighbors_sha256": "70a12681daabf40bd50a8fdccfd078a8e0d8fd19e6378d8014ce97280961c02c",
+  "queries": "/raid/blandrum/local_datasets/wiki_all_10M/queries.fbin",
+  "query_dtype": "float32",
+  "query_rows": 10000,
+  "search_seconds": 21.752325790934265,
+  "selected_rows": 1000000,
+  "tf32_enabled": false,
+  "upload_seconds": 4.283742554020137
+}

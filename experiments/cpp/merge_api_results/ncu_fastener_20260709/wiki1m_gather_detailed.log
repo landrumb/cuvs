@@ -1,0 +1,4 @@
+==PROF== Connected to process 3965410 (/home/coder/cuvs-fastener-device-memory/experiments/cpp/build-ncu/CAGRA_MERGE_API_BENCH)
+==PROF== Profiling "gather_float_leaf_vectors_kernel": 0%....50%....100% - 20 passes
+==PROF== Disconnected from process 3965410
+==PROF== Report: /home/coder/cuvs-fastener-device-memory/experiments/cpp/merge_api_results/ncu_fastener_20260709/wiki1m_gather_detailed.ncu-rep

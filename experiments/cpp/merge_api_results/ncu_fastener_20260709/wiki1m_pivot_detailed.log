@@ -1,0 +1,4 @@
+==PROF== Connected to process 3964184 (/home/coder/cuvs-fastener-device-memory/experiments/cpp/build-ncu/CAGRA_MERGE_API_BENCH)
+==PROF== Profiling "pivot_assign_sides_kernel": 0%....50%....100% - 20 passes
+==PROF== Disconnected from process 3964184
+==PROF== Report: /home/coder/cuvs-fastener-device-memory/experiments/cpp/merge_api_results/ncu_fastener_20260709/wiki1m_pivot_detailed.ncu-rep
