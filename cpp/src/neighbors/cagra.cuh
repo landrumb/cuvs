@@ -386,6 +386,43 @@ template <typename T,
           typename IdxT,
           cuvs::neighbors::ann_dataset_view DatasetViewT,
           typename OutputIdxT>
+void search_with_seeds(raft::resources const& res,
+                       const search_params& params,
+                       const index<T, IdxT, DatasetViewT>& idx,
+                       raft::device_matrix_view<const T, int64_t, raft::row_major> queries,
+                       raft::device_matrix_view<const IdxT, int64_t, raft::row_major> seeds,
+                       raft::device_matrix_view<OutputIdxT, int64_t, raft::row_major> neighbors,
+                       raft::device_matrix_view<float, int64_t, raft::row_major> distances)
+{
+  RAFT_EXPECTS(queries.extent(0) == seeds.extent(0) && queries.extent(0) == neighbors.extent(0) &&
+                 queries.extent(0) == distances.extent(0),
+               "Number of seed and output rows must equal the number of queries");
+  RAFT_EXPECTS(neighbors.extent(1) == distances.extent(1),
+               "Number of neighbor and distance columns must match");
+  RAFT_EXPECTS(queries.extent(1) == idx.dim(),
+               "Number of query dimensions must equal index dimensions");
+  RAFT_EXPECTS(seeds.extent(1) > 0, "At least one seed per query is required");
+  auto params_copy = params;
+  if (params_copy.filtering_rate < 0.0) { params_copy.filtering_rate = 0.0; }
+  return cagra::detail::search_main<T,
+                                    OutputIdxT,
+                                    cuvs::neighbors::filtering::none_sample_filter,
+                                    IdxT,
+                                    float,
+                                    DatasetViewT>(res,
+                                                  params_copy,
+                                                  idx,
+                                                  queries,
+                                                  neighbors,
+                                                  distances,
+                                                  cuvs::neighbors::filtering::none_sample_filter{},
+                                                  seeds);
+}
+
+template <typename T,
+          typename IdxT,
+          cuvs::neighbors::ann_dataset_view DatasetViewT,
+          typename OutputIdxT>
 void search(raft::resources const& res,
             const search_params& params,
             const index<T, IdxT, DatasetViewT>& idx,

@@ -46,6 +46,19 @@ CUVS_INST_CAGRA_SEARCH_ALL_VIEWS(data_t, int64_t);
 #undef CUVS_INST_CAGRA_SEARCH_ALL_VIEWS
 #undef CUVS_INST_CAGRA_SEARCH
 
+void search_with_seeds(
+  raft::resources const& handle,
+  cuvs::neighbors::cagra::search_params const& params,
+  const cuvs::neighbors::cagra::index<data_t, uint32_t, inst_device_padded_view_t>& index,
+  raft::device_matrix_view<const data_t, int64_t, raft::row_major> queries,
+  raft::device_matrix_view<const uint32_t, int64_t, raft::row_major> seeds,
+  raft::device_matrix_view<uint32_t, int64_t, raft::row_major> neighbors,
+  raft::device_matrix_view<float, int64_t, raft::row_major> distances)
+{
+  cuvs::neighbors::cagra::search_with_seeds<data_t, uint32_t, inst_device_padded_view_t, uint32_t>(
+    handle, params, index, queries, seeds, neighbors, distances);
+}
+
 template CUVS_EXPORT __attribute__((externally_visible)) void
 index<data_t, uint32_t, inst_device_padded_view_t>::compute_dataset_norms_(
   raft::resources const& res);

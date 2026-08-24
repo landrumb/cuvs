@@ -1336,6 +1336,39 @@ void search(raft::resources const& res,
               cuvs::neighbors::filtering::none_sample_filter{});
 
 /**
+ * @brief Search CAGRA from query-specific graph entry points.
+ *
+ * The seed matrix is device-resident and row-aligned with queries. Seed IDs
+ * initialize the normal CAGRA traversal; remaining initial candidates retain
+ * the standard deterministic random selection. Traversal, visited-set, and
+ * top-k behavior are otherwise identical to `search`.
+ *
+ * @param[in] res raft resources
+ * @param[in] params configure the search
+ * @param[in] index pre-built padded CAGRA index
+ * @param[in] queries device query matrix [n_queries, index.dim()]
+ * @param[in] seeds device entry-point matrix [n_queries, n_seeds]
+ * @param[out] neighbors device neighbor matrix [n_queries, k]
+ * @param[out] distances device distance matrix [n_queries, k]
+ */
+void search_with_seeds(raft::resources const& res,
+                       cuvs::neighbors::cagra::search_params const& params,
+                       const cuvs::neighbors::cagra::device_padded_index<float, uint32_t>& index,
+                       raft::device_matrix_view<const float, int64_t, raft::row_major> queries,
+                       raft::device_matrix_view<const uint32_t, int64_t, raft::row_major> seeds,
+                       raft::device_matrix_view<uint32_t, int64_t, raft::row_major> neighbors,
+                       raft::device_matrix_view<float, int64_t, raft::row_major> distances);
+
+/** @brief uint8_t overload of query-specific seeded CAGRA search. */
+void search_with_seeds(raft::resources const& res,
+                       cuvs::neighbors::cagra::search_params const& params,
+                       const cuvs::neighbors::cagra::device_padded_index<uint8_t, uint32_t>& index,
+                       raft::device_matrix_view<const uint8_t, int64_t, raft::row_major> queries,
+                       raft::device_matrix_view<const uint32_t, int64_t, raft::row_major> seeds,
+                       raft::device_matrix_view<uint32_t, int64_t, raft::row_major> neighbors,
+                       raft::device_matrix_view<float, int64_t, raft::row_major> distances);
+
+/**
  * @brief Search ANN using the constructed index.
  *
  * See the [cagra::build](#cagra::build) documentation for a usage example.

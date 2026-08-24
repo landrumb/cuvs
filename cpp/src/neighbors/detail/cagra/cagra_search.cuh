@@ -57,7 +57,9 @@ void search_main_core(
   raft::device_matrix_view<const DataT, int64_t, raft::row_major> queries,
   raft::device_matrix_view<OutputIdxT, int64_t, raft::row_major> neighbors,
   raft::device_matrix_view<DistanceT, int64_t, raft::row_major> distances,
-  CagraSampleFilterT sample_filter = CagraSampleFilterT())
+  CagraSampleFilterT sample_filter = CagraSampleFilterT(),
+  std::optional<raft::device_matrix_view<const IndexT, int64_t, raft::row_major>> seeds =
+    std::nullopt)
 {
   static_assert(std::is_same_v<IndexT, uint32_t>,
                 "Only uint32_t is supported as the graph element type (internal index type)");
@@ -68,6 +70,14 @@ void search_main_core(
                  static_cast<size_t>(queries.extent(0)),
                  static_cast<size_t>(queries.extent(1)));
   const uint32_t topk = neighbors.extent(1);
+  if (seeds.has_value()) {
+    RAFT_EXPECTS(seeds->extent(0) == queries.extent(0),
+                 "Number of seed rows must equal number of queries");
+    RAFT_EXPECTS(seeds->extent(1) > 0 && seeds->extent(1) <= std::numeric_limits<uint32_t>::max(),
+                 "Seed width must be in the uint32_t range");
+    RAFT_EXPECTS(!params.persistent,
+                 "Query-specific CAGRA seeds are not supported by persistent search");
+  }
 
   cudaDeviceProp deviceProp = raft::resource::get_device_properties(res);
   if (params.max_queries == 0) {
@@ -87,6 +97,7 @@ void search_main_core(
       res, params, dataset_desc, queries.extent(1), graph.extent(0), graph.extent(1), topk);
 
   plan->check(topk);
+  if (seeds.has_value()) { plan->num_seeds = static_cast<uint32_t>(seeds->extent(1)); }
 
   RAFT_LOG_DEBUG("Cagra search");
   const uint32_t max_queries = plan->max_queries;
@@ -119,9 +130,11 @@ void search_main_core(
       const auto* _query_ptr =
         queries_buf + (static_cast<size_t>(query_row_stride) * static_cast<size_t>(qid));
       const auto* _seed_ptr =
-        plan->num_seeds > 0
-          ? reinterpret_cast<const IndexT*>(plan->dev_seed.data()) + (plan->num_seeds * qid)
-          : nullptr;
+        seeds.has_value()
+          ? seeds->data_handle() + (plan->num_seeds * qid)
+          : (plan->num_seeds > 0
+               ? reinterpret_cast<const IndexT*>(plan->dev_seed.data()) + (plan->num_seeds * qid)
+               : nullptr);
       uint32_t* _num_executed_iterations = nullptr;
 
       (*plan)(res,
@@ -142,9 +155,11 @@ void search_main_core(
         auto _topk_distances_ptr = distances.data_handle() + (topk * g);
         const auto* _query_ptr   = queries_buf + (query_row_stride * g);
         const auto* _seed_ptr =
-          plan->num_seeds > 0
-            ? reinterpret_cast<const IndexT*>(plan->dev_seed.data()) + (plan->num_seeds * g)
-            : nullptr;
+          seeds.has_value()
+            ? seeds->data_handle() + (plan->num_seeds * g)
+            : (plan->num_seeds > 0
+                 ? reinterpret_cast<const IndexT*>(plan->dev_seed.data()) + (plan->num_seeds * g)
+                 : nullptr);
         uint32_t* _num_executed_iterations = nullptr;
 
         (*plan)(res,
@@ -193,7 +208,9 @@ void search_main(raft::resources const& res,
                  raft::device_matrix_view<const T, int64_t, raft::row_major> queries,
                  raft::device_matrix_view<OutputIdxT, int64_t, raft::row_major> neighbors,
                  raft::device_matrix_view<DistanceT, int64_t, raft::row_major> distances,
-                 CagraSampleFilterT sample_filter = CagraSampleFilterT())
+                 CagraSampleFilterT sample_filter = CagraSampleFilterT(),
+                 std::optional<raft::device_matrix_view<const IdxT, int64_t, raft::row_major>>
+                   seeds = std::nullopt)
 {
   RAFT_EXPECTS(!index.dataset_fd().has_value(),
                "Cannot search a CAGRA index that is stored on disk. "
@@ -227,7 +244,8 @@ void search_main(raft::resources const& res,
       queries,
       neighbors,
       distances,
-      sample_filter);
+      sample_filter,
+      seeds);
   };
 
   if constexpr (cuvs::neighbors::is_empty_dataset_view_v<DatasetViewT>) {
@@ -255,7 +273,8 @@ void search_main(raft::resources const& res,
       queries,
       neighbors,
       distances,
-      sample_filter);
+      sample_filter,
+      seeds);
   } else if constexpr (cuvs::neighbors::is_device_standard_dataset_view_v<DatasetViewT>) {
     RAFT_FAIL(
       "CAGRA search requires a padded device dataset. Build from a standard dataset view, then "

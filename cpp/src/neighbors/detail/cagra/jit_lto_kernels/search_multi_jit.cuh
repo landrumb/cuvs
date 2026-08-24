@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -56,9 +56,11 @@ __device__ void random_pickup_kernel_jit(
 
   INDEX_T best_index_team_local;
   DISTANCE_T best_norm2_team_local = utils::get_max_value<DISTANCE_T>();
-  for (unsigned i = 0; i < num_distilation; i++) {
+  auto const explicit_seed         = seed_ptr && global_team_index < num_seeds;
+  auto const distillation_count    = explicit_seed ? 1u : num_distilation;
+  for (unsigned i = 0; i < distillation_count; i++) {
     INDEX_T seed_index;
-    if (seed_ptr && (global_team_index < num_seeds)) {
+    if (explicit_seed) {
       seed_index = seed_ptr[global_team_index + (num_seeds * query_id)];
     } else {
       seed_index =

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -62,12 +62,15 @@ RAFT_DEVICE_INLINE_FUNCTION void compute_distance_to_random_nodes_jit(
 
     IndexT best_index_team_local    = raft::upper_bound<IndexT>();
     DistanceT best_norm2_team_local = raft::upper_bound<DistanceT>();
-    for (uint32_t j = 0; j < num_distilation; j++) {
+    auto const explicit_seed_index  = block_id + (num_blocks * i);
+    auto const explicit_seed        = seed_ptr && valid_i && explicit_seed_index < num_seeds;
+    auto const distillation_count   = explicit_seed ? 1u : num_distilation;
+    for (uint32_t j = 0; j < distillation_count; j++) {
       IndexT seed_index = 0;
       if (valid_i) {
         uint32_t gid = block_id + (num_blocks * (i + (num_pickup * j)));
-        if (seed_ptr && (gid < num_seeds)) {
-          seed_index = seed_ptr[gid];
+        if (explicit_seed) {
+          seed_index = seed_ptr[explicit_seed_index];
         } else {
           seed_index = device::xorshift64(gid ^ rand_xor_mask) % seed_index_limit;
         }
