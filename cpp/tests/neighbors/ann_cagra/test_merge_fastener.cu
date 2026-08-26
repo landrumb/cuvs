@@ -1407,6 +1407,43 @@ auto make_float_indices(raft::resources const& res,
 }
 
 /**
+ * Exercises the maximum supported leaf size through the real 512-thread leaf-KNN launch.
+ */
+TEST(CagraMergeFastener, SupportsMaximum512LeafSize)
+{
+  raft::resources res;
+  constexpr int64_t rows = 256;
+  constexpr int64_t dim  = 8;
+  auto dataset0          = make_dataset<float>(res, rows, dim, 1234ULL);
+  auto dataset1          = make_dataset<float>(res, rows, dim, 5678ULL);
+  auto graph0            = make_ring_graph(res, rows, 4);
+  auto graph1            = make_ring_graph(res, rows, 4);
+  index_params params;
+  params.metric                    = cuvs::distance::DistanceType::L2Expanded;
+  params.graph_degree              = 4;
+  params.intermediate_graph_degree = 8;
+  params.attach_dataset_on_build   = true;
+  auto owned = make_float_indices(res, params.metric, dataset0, dataset1, graph0, graph1);
+  std::vector<cagra::device_padded_index<float, uint32_t>*> indices{&owned.indices[0],
+                                                                    &owned.indices[1]};
+  merge_params fastener;
+  fastener.algo            = merge_algo::FASTENER;
+  fastener.levels          = 1;
+  fastener.root_fanout     = 1;
+  fastener.lower_fanout    = 1;
+  fastener.leader_fraction = 0.02;
+  fastener.max_leaders     = 1024;
+  fastener.leaf_size       = 512;
+  fastener.leaf_degree     = 4;
+
+  auto merged_storage = make_merged_storage<float>(res, rows * 2, dim);
+  auto merged         = merge(res, params, indices, merged_storage.view, fastener);
+  expect_valid_graph(merged, rows * 2, params.graph_degree);
+  EXPECT_EQ(owned.indices[0].dataset().n_rows(), rows);
+  EXPECT_EQ(owned.indices[1].dataset().n_rows(), rows);
+}
+
+/**
  * Exercises invalid levels, fanouts, leader settings, leaf settings, and spill width, and verifies
  * that preflight rejects each configuration without changing either input dataset.
  */
@@ -1448,7 +1485,7 @@ TEST(CagraMergeFastener, InvalidManywayOptionsFailPreflightWithoutMutation)
   add_invalid([](auto& value) { value.max_leaders = 8193; });
   add_invalid([](auto& value) { value.max_leaders = 2; });
   add_invalid([](auto& value) { value.leaf_size = 0; });
-  add_invalid([](auto& value) { value.leaf_size = 512; });
+  add_invalid([](auto& value) { value.leaf_size = 1024; });
   add_invalid([](auto& value) { value.leaf_degree = 0; });
   add_invalid([](auto& value) { value.leaf_degree = 16; });
   add_invalid([](auto& value) {
@@ -1492,7 +1529,7 @@ TEST(CagraMergeFastener, DispatchRejectsOrFallsBackBeforeMutation)
                                                                       &owned.indices[1]};
     merge_params unsupported;
     unsupported.algo      = merge_algo::FASTENER;
-    unsupported.leaf_size = 512;
+    unsupported.leaf_size = 1024;
     EXPECT_ANY_THROW(merge(res, params, indices, throwaway_storage.view, unsupported));
     EXPECT_EQ(owned.indices[0].dataset().n_rows(), rows);
     EXPECT_EQ(owned.indices[1].dataset().n_rows(), rows);
@@ -1519,7 +1556,7 @@ TEST(CagraMergeFastener, DispatchRejectsOrFallsBackBeforeMutation)
                                                                       &owned.indices[1]};
     merge_params automatic;
     automatic.algo      = merge_algo::AUTO;
-    automatic.leaf_size = 512;
+    automatic.leaf_size = 1024;
     auto merged         = merge(res, params, indices, throwaway_storage.view, automatic);
     EXPECT_EQ(merged.size(), rows * 2);
     EXPECT_EQ(owned.indices[0].dataset().n_rows(), rows);

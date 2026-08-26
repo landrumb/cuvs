@@ -37,7 +37,7 @@ namespace cuvs::neighbors::cagra::detail::merge_scaffold {
 
 inline constexpr uint32_t MAX_FANOUT         = 32;
 inline constexpr uint32_t MAX_LEADERS        = 8192;
-inline constexpr uint32_t MAX_LEAF_SIZE      = 256;
+inline constexpr uint32_t MAX_LEAF_SIZE      = 512;
 inline constexpr int MAX_LEAF_DEGREE         = 8;
 inline constexpr int ASSIGNMENT_TILE_ROWS    = 2048;
 inline constexpr uint64_t DETERMINISTIC_SEED = 0x4c616e6472756d;

@@ -3502,7 +3502,7 @@ struct merge_params {
  * Fastener supports unfiltered, uncompressed `float`, `half`, `int8_t`, and `uint8_t`
  * indices using L2Expanded and `uint32_t` graph IDs. Fastener uses `root_fanout` at the first
  * split and `lower_fanout` at every later split. Fanouts from 1 through 32, leader fractions in
- * (0, 1], leader caps through 8192, leaf sizes from 1 through 256, and leaf degrees from 1
+ * (0, 1], leader caps through 8192, leaf sizes from 1 through 512, and leaf degrees from 1
  * through 8 are supported. The configured spill width times `leaf_degree` must not exceed 255.
  * `index_params::graph_degree` is the final output degree.
  *
