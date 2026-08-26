@@ -24,8 +24,10 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <optional>
+#include <string_view>
 
 namespace cuvs::neighbors::cagra::detail::merge_scaffold {
 namespace {
@@ -108,6 +110,106 @@ __global__ void emit_tile_assignments_kernel(int const* selected_leaders,
         membership.id,
         static_cast<uint16_t>(membership.occurrence + rank * occurrence_stride),
         uint16_t{0}};
+    }
+  }
+}
+
+struct fused_leader_candidate {
+  float distance  = std::numeric_limits<float>::infinity();
+  uint32_t leader = std::numeric_limits<uint32_t>::max();
+};
+
+__device__ inline bool candidate_precedes(fused_leader_candidate left, fused_leader_candidate right)
+{
+  return left.distance < right.distance ||
+         (left.distance == right.distance && left.leader < right.leader);
+}
+
+template <int K>
+__device__ inline void insert_sorted_candidate(fused_leader_candidate candidate,
+                                               fused_leader_candidate (&best)[K])
+{
+  if (!candidate_precedes(candidate, best[K - 1])) { return; }
+  int position = K - 1;
+  while (position > 0 && candidate_precedes(candidate, best[position - 1])) {
+    best[position] = best[position - 1];
+    --position;
+  }
+  best[position] = candidate;
+}
+
+/** Fuse squared-L2 materialization, sorted top-k, and assignment emission.
+ *
+ * One warp owns one point row. Each lane builds a sorted top-k list over its strided leaders,
+ * then the warp performs k merge steps with shuffle reductions. This keeps the selected leaders
+ * in registers and writes the final keys/memberships directly, avoiding both generic select_k
+ * workspaces and the two neighboring kernel launches.
+ */
+template <int K>
+__global__ void fused_select_emit_tile_assignments_kernel(
+  float const* dots,
+  int batch_size,
+  int tile_rows,
+  int padded_leaders,
+  int occurrence_stride,
+  float const* norms,
+  uint32_t const* leader_ids,
+  partition_membership const* input_memberships,
+  assignment_tile const* tiles,
+  uint32_t* output_keys,
+  partition_membership* output_memberships)
+{
+  constexpr int WARPS_PER_BLOCK = THREADS_PER_BLOCK / raft::WarpSize;
+  int lane                      = threadIdx.x % raft::WarpSize;
+  int warp                      = threadIdx.x / raft::WarpSize;
+  int64_t linear_row            = static_cast<int64_t>(blockIdx.x) * WARPS_PER_BLOCK + warp;
+  int64_t row_stride            = static_cast<int64_t>(gridDim.x) * WARPS_PER_BLOCK;
+  int64_t total_rows            = static_cast<int64_t>(batch_size) * tile_rows;
+
+  for (; linear_row < total_rows; linear_row += row_stride) {
+    int batch = static_cast<int>(linear_row / tile_rows);
+    int row   = static_cast<int>(linear_row % tile_rows);
+    auto tile = tiles[batch];
+    if (row >= tile.rows) { continue; }
+
+    auto membership = input_memberships[tile.input_start + row];
+    fused_leader_candidate local_best[K];
+    int64_t dot_base    = linear_row * padded_leaders;
+    int64_t leader_base = static_cast<int64_t>(batch) * padded_leaders;
+    for (int leader = lane; leader < tile.leader_count; leader += raft::WarpSize) {
+      uint32_t leader_id = leader_ids[leader_base + leader];
+      float distance =
+        fmaxf(0.0f, norms[membership.id] + norms[leader_id] - 2.0f * dots[dot_base + leader]);
+      if (isfinite(distance)) {
+        insert_sorted_candidate<K>(fused_leader_candidate{distance, static_cast<uint32_t>(leader)},
+                                   local_best);
+      }
+    }
+
+    int local_cursor    = 0;
+    int64_t output_base = tile.output_start + static_cast<int64_t>(row) * K;
+    for (int rank = 0; rank < K; ++rank) {
+      fused_leader_candidate candidate = local_best[local_cursor];
+      int source_lane                  = lane;
+      for (int offset = raft::WarpSize / 2; offset > 0; offset /= 2) {
+        fused_leader_candidate other{__shfl_down_sync(0xffffffffu, candidate.distance, offset),
+                                     __shfl_down_sync(0xffffffffu, candidate.leader, offset)};
+        int other_lane = __shfl_down_sync(0xffffffffu, source_lane, offset);
+        if (lane + offset < raft::WarpSize && candidate_precedes(other, candidate)) {
+          candidate   = other;
+          source_lane = other_lane;
+        }
+      }
+      int winner_lane          = __shfl_sync(0xffffffffu, source_lane, 0);
+      uint32_t selected_leader = __shfl_sync(0xffffffffu, candidate.leader, 0);
+      if (lane == 0) {
+        output_keys[output_base + rank]        = tile.child_key_base + selected_leader;
+        output_memberships[output_base + rank] = {
+          membership.id,
+          static_cast<uint16_t>(membership.occurrence + rank * occurrence_stride),
+          uint16_t{0}};
+      }
+      if (lane == winner_lane) { ++local_cursor; }
     }
   }
 }
@@ -276,6 +378,14 @@ __global__ void deduplicate_graph_prefix_kernel(uint32_t const* input,
 
 }  // namespace
 
+bool assignment_selection_is_fused()
+{
+  auto const* value = std::getenv("CUVS_FASTENER_ASSIGNMENT_SELECTION");
+  if (value == nullptr || std::string_view{value} == "select-k") { return false; }
+  if (std::string_view{value} == "fused-warp") { return true; }
+  RAFT_FAIL("CUVS_FASTENER_ASSIGNMENT_SELECTION must be select-k or fused-warp");
+}
+
 void select_nearest_leaders(raft::resources const& res,
                             float const* distances,
                             int64_t rows,
@@ -400,6 +510,49 @@ void launch_emit_tile_assignments(raft::resources const& res,
                                                                          tiles,
                                                                          output_keys,
                                                                          output_memberships);
+  RAFT_CUDA_TRY(cudaGetLastError());
+}
+
+void launch_fused_select_emit_tile_assignments(raft::resources const& res,
+                                               float const* dots,
+                                               int batch_size,
+                                               int tile_rows,
+                                               int padded_leaders,
+                                               int fanout,
+                                               int occurrence_stride,
+                                               float const* norms,
+                                               uint32_t const* leader_ids,
+                                               partition_membership const* input_memberships,
+                                               assignment_tile const* tiles,
+                                               uint32_t* output_keys,
+                                               partition_membership* output_memberships)
+{
+  constexpr int WARPS_PER_BLOCK = THREADS_PER_BLOCK / raft::WarpSize;
+  int64_t rows                  = static_cast<int64_t>(batch_size) * tile_rows;
+  int blocks                    = static_cast<int>(std::min<int64_t>(
+    raft::div_rounding_up_safe<int64_t>(rows, WARPS_PER_BLOCK), MAX_STRIDED_GRID_BLOCKS));
+  auto stream                   = raft::resource::get_cuda_stream(res);
+#define CUVS_FASTENER_LAUNCH_FUSED(K)                             \
+  fused_select_emit_tile_assignments_kernel<K>                    \
+    <<<blocks, THREADS_PER_BLOCK, 0, stream>>>(dots,              \
+                                               batch_size,        \
+                                               tile_rows,         \
+                                               padded_leaders,    \
+                                               occurrence_stride, \
+                                               norms,             \
+                                               leader_ids,        \
+                                               input_memberships, \
+                                               tiles,             \
+                                               output_keys,       \
+                                               output_memberships)
+  switch (fanout) {
+    case 1: CUVS_FASTENER_LAUNCH_FUSED(1); break;
+    case 2: CUVS_FASTENER_LAUNCH_FUSED(2); break;
+    case 4: CUVS_FASTENER_LAUNCH_FUSED(4); break;
+    case 8: CUVS_FASTENER_LAUNCH_FUSED(8); break;
+    default: RAFT_FAIL("fused-warp Fastener assignment supports fanout 1, 2, 4, or 8");
+  }
+#undef CUVS_FASTENER_LAUNCH_FUSED
   RAFT_CUDA_TRY(cudaGetLastError());
 }
 

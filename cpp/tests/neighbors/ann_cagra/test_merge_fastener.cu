@@ -25,7 +25,9 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <numeric>
 #include <type_traits>
@@ -588,6 +590,64 @@ TEST(CagraMergeFastener, ScaffoldConstructionIsBitReproducible)
   EXPECT_EQ(differing, 0u) << differing << " of " << first.size()
                            << " scaffold entries differ between identical runs, first at index "
                            << first_difference;
+}
+
+/** The implementation ablation must change only how assignments are selected, not the scaffold. */
+TEST(CagraMergeFastener, FusedAssignmentMatchesSelectKNeighborSets)
+{
+  using namespace detail::merge_scaffold;
+  raft::resources res;
+  auto stream                 = raft::resource::get_cuda_stream(res);
+  constexpr int64_t part_rows = 4000;
+  constexpr int64_t rows      = part_rows * 2;
+  constexpr int64_t dim       = 32;
+
+  auto host = make_dataset<float>(res, rows, dim, 8484ULL);
+  auto data = raft::make_device_matrix<float, int64_t>(res, rows, dim);
+  raft::copy(data.data_handle(), host.data_handle(), host.size(), stream);
+  raft::resource::sync_stream(res);
+  std::vector<int64_t> offsets{0, part_rows, rows};
+  build_params params;
+  params.root_fanout  = 4;
+  params.lower_fanout = 2;
+
+  auto scaffold_bytes = [&](char const* implementation) {
+    if (setenv("CUVS_FASTENER_ASSIGNMENT_SELECTION", implementation, 1) != 0) {
+      throw std::runtime_error("failed to select Fastener assignment implementation");
+    }
+    auto scaffold = build<float>(res, raft::make_const_mdspan(data.view()), dim, offsets, params);
+    std::vector<uint32_t> output(static_cast<size_t>(scaffold.size()));
+    raft::copy(output.data(), scaffold.data_handle(), output.size(), stream);
+    raft::resource::sync_stream(res);
+    return output;
+  };
+
+  auto select_k = scaffold_bytes("select-k");
+  auto fused    = scaffold_bytes("fused-warp");
+  ASSERT_EQ(unsetenv("CUVS_FASTENER_ASSIGNMENT_SELECTION"), 0);
+  ASSERT_EQ(fused.size(), select_k.size());
+  size_t differing_entries = 0;
+  size_t first_difference  = fused.size();
+  for (size_t index = 0; index < fused.size(); ++index) {
+    if (fused[index] != select_k[index]) {
+      ++differing_entries;
+      first_difference = std::min(first_difference, index);
+    }
+  }
+  size_t differing_row_sets        = 0;
+  constexpr size_t scaffold_degree = 4 * 2 * 4;
+  for (size_t row = 0; row < fused.size() / scaffold_degree; ++row) {
+    std::array<uint32_t, scaffold_degree> fused_row;
+    std::array<uint32_t, scaffold_degree> select_k_row;
+    std::copy_n(fused.begin() + row * scaffold_degree, scaffold_degree, fused_row.begin());
+    std::copy_n(select_k.begin() + row * scaffold_degree, scaffold_degree, select_k_row.begin());
+    std::sort(fused_row.begin(), fused_row.end());
+    std::sort(select_k_row.begin(), select_k_row.end());
+    differing_row_sets += fused_row != select_k_row;
+  }
+  EXPECT_EQ(differing_row_sets, 0u)
+    << differing_entries << " ordered entries differ, first at " << first_difference << ", row "
+    << first_difference / scaffold_degree;
 }
 
 /**

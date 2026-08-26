@@ -175,6 +175,21 @@ CUVS_EXPORT void launch_emit_tile_assignments(raft::resources const& res,
                                               assignment_tile const* tiles,
                                               uint32_t* output_keys,
                                               partition_membership* output_memberships);
+CUVS_EXPORT bool assignment_selection_is_fused();
+CUVS_EXPORT void launch_fused_select_emit_tile_assignments(
+  raft::resources const& res,
+  float const* dots,
+  int batch_size,
+  int tile_rows,
+  int padded_leaders,
+  int fanout,
+  int occurrence_stride,
+  float const* norms,
+  uint32_t const* leader_ids,
+  partition_membership const* input_memberships,
+  assignment_tile const* tiles,
+  uint32_t* output_keys,
+  partition_membership* output_memberships);
 CUVS_EXPORT void select_nearest_leaders(raft::resources const& res,
                                         float const* distances,
                                         int64_t rows,
@@ -479,23 +494,30 @@ inline void carry_parents(raft::resources const& res,
 }
 
 /** Workspace bytes `assign_bucket` needs for `capacity` tiles of `rows_per_tile` rows each */
-inline auto assignment_workspace_bytes(
-  size_t capacity, size_t rows_per_tile, size_t padded_leaders, size_t dim, size_t fanout) -> size_t
+inline auto assignment_workspace_bytes(size_t capacity,
+                                       size_t rows_per_tile,
+                                       size_t padded_leaders,
+                                       size_t dim,
+                                       size_t fanout,
+                                       bool fused = false) -> size_t
 {
   auto aligned = [](size_t bytes) { return rmm::align_up(bytes, rmm::CUDA_ALLOCATION_ALIGNMENT); };
   size_t point_elements    = rows_per_tile * dim;
   size_t leader_elements   = padded_leaders * dim;
   size_t dot_elements      = rows_per_tile * padded_leaders;
   size_t selected_elements = rows_per_tile * fanout;
-  return aligned(capacity * sizeof(assignment_tile)) +
-         aligned(capacity * point_elements * sizeof(float)) +
-         aligned(capacity * leader_elements * sizeof(float)) +
-         aligned(capacity * dot_elements * sizeof(float)) +
-         aligned(capacity * padded_leaders * sizeof(uint32_t)) +
-         aligned(capacity * selected_elements * sizeof(float)) +
-         aligned(capacity * selected_elements * sizeof(int)) +
-         aligned(capacity * dot_elements * sizeof(float)) +
-         aligned(capacity * dot_elements * sizeof(int));
+  size_t bytes             = aligned(capacity * sizeof(assignment_tile)) +
+                 aligned(capacity * point_elements * sizeof(float)) +
+                 aligned(capacity * leader_elements * sizeof(float)) +
+                 aligned(capacity * dot_elements * sizeof(float)) +
+                 aligned(capacity * padded_leaders * sizeof(uint32_t));
+  if (!fused) {
+    bytes += aligned(capacity * selected_elements * sizeof(float)) +
+             aligned(capacity * selected_elements * sizeof(int)) +
+             aligned(capacity * dot_elements * sizeof(float)) +
+             aligned(capacity * dot_elements * sizeof(int));
+  }
+  return bytes;
 }
 
 /** Return true if the widest padded leader matrix + a single point row fits the workspace.
@@ -543,13 +565,15 @@ void assign_bucket(raft::resources const& res,
   auto dim              = context.logical_dim;
   auto workspace_mr     = raft::resource::get_workspace_resource_ref(res);
   auto workspace_bytes  = raft::resource::get_workspace_free_bytes(res);
+  bool const fused      = assignment_selection_is_fused();
 
   auto tile_bytes = [&](size_t capacity, size_t rows_per_tile) {
     return assignment_workspace_bytes(capacity,
                                       rows_per_tile,
                                       static_cast<size_t>(padded_leaders),
                                       static_cast<size_t>(dim),
-                                      static_cast<size_t>(params.fanout));
+                                      static_cast<size_t>(params.fanout),
+                                      fused);
   };
 
   // Preflight rejects any configuration whose widest leader matrix cannot host a single point row,
@@ -611,14 +635,18 @@ void assign_bucket(raft::resources const& res,
     res,
     workspace_mr,
     raft::make_extents<int64_t>(static_cast<int64_t>(batch_capacity) * padded_leaders));
-  auto selected_distances = raft::make_device_mdarray<float, int64_t>(
-    res,
-    workspace_mr,
-    raft::make_extents<int64_t>(static_cast<int64_t>(batch_capacity * selected_elements)));
-  auto selected_leaders = raft::make_device_mdarray<int, int64_t>(
-    res,
-    workspace_mr,
-    raft::make_extents<int64_t>(static_cast<int64_t>(batch_capacity * selected_elements)));
+  std::optional<raft::device_vector<float, int64_t>> selected_distances;
+  std::optional<raft::device_vector<int, int64_t>> selected_leaders;
+  if (!fused) {
+    selected_distances.emplace(raft::make_device_mdarray<float, int64_t>(
+      res,
+      workspace_mr,
+      raft::make_extents<int64_t>(static_cast<int64_t>(batch_capacity * selected_elements))));
+    selected_leaders.emplace(raft::make_device_mdarray<int, int64_t>(
+      res,
+      workspace_mr,
+      raft::make_extents<int64_t>(static_cast<int64_t>(batch_capacity * selected_elements))));
+  }
 
   auto point_stride  = static_cast<int64_t>(point_elements);
   auto leader_stride = static_cast<int64_t>(leader_elements);
@@ -667,36 +695,53 @@ void assign_bucket(raft::resources const& res,
                              static_cast<int>(dim),
                              static_cast<int>(batch_size));
 
-    // Materialize distances, keep each row's nearest leaders, and emit their memberships
+    // Materialize distances, keep each row's nearest leaders, and emit their memberships. The
+    // experimental fused path performs all three operations in one warp-cooperative launch.
     int64_t selection_rows = static_cast<int64_t>(batch_size) * tile_rows;
-    launch_materialize_tile_distances(res,
-                                      tile_dots.data_handle(),
-                                      static_cast<int>(batch_size),
-                                      tile_rows,
-                                      padded_leaders,
-                                      context.norms.data_handle(),
-                                      tile_leader_ids.data_handle(),
-                                      parents.memberships.data_handle(),
-                                      device_tiles.data_handle());
+    if (fused) {
+      launch_fused_select_emit_tile_assignments(res,
+                                                tile_dots.data_handle(),
+                                                static_cast<int>(batch_size),
+                                                tile_rows,
+                                                padded_leaders,
+                                                static_cast<int>(params.fanout),
+                                                static_cast<int>(params.occurrence_stride),
+                                                context.norms.data_handle(),
+                                                tile_leader_ids.data_handle(),
+                                                parents.memberships.data_handle(),
+                                                device_tiles.data_handle(),
+                                                keys.data_handle(),
+                                                memberships.data_handle());
+    } else {
+      launch_materialize_tile_distances(res,
+                                        tile_dots.data_handle(),
+                                        static_cast<int>(batch_size),
+                                        tile_rows,
+                                        padded_leaders,
+                                        context.norms.data_handle(),
+                                        tile_leader_ids.data_handle(),
+                                        parents.memberships.data_handle(),
+                                        device_tiles.data_handle());
 
-    select_nearest_leaders(res,
-                           tile_dots.data_handle(),
-                           selection_rows,
-                           padded_leaders,
-                           static_cast<int>(params.fanout),
-                           selected_distances.data_handle(),
-                           selected_leaders.data_handle());
+      select_nearest_leaders(res,
+                             tile_dots.data_handle(),
+                             selection_rows,
+                             padded_leaders,
+                             static_cast<int>(params.fanout),
+                             selected_distances->data_handle(),
+                             selected_leaders->data_handle());
 
-    launch_emit_tile_assignments(res,
-                                 selected_leaders.data_handle(),
-                                 static_cast<int>(batch_size),
-                                 tile_rows,
-                                 static_cast<int>(params.fanout),
-                                 static_cast<int>(params.occurrence_stride),
-                                 parents.memberships.data_handle(),
-                                 device_tiles.data_handle(),
-                                 keys.data_handle(),
-                                 memberships.data_handle());
+      launch_emit_tile_assignments(res,
+                                   selected_leaders->data_handle(),
+                                   static_cast<int>(batch_size),
+                                   tile_rows,
+                                   static_cast<int>(params.fanout),
+                                   static_cast<int>(params.occurrence_stride),
+                                   parents.memberships.data_handle(),
+                                   device_tiles.data_handle(),
+                                   keys.data_handle(),
+                                   memberships.data_handle());
+    }
   }
 }
 
