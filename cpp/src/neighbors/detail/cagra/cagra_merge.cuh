@@ -380,6 +380,12 @@ void copy_input_datasets(
 {
   for (std::size_t i = 0; i < indices.size(); ++i) {
     auto const& source = indices[i]->dataset();
+    // The caller may attach input indexes to their final row ranges. Avoid
+    // copying an exactly identical view onto itself; other layouts still copy.
+    if (source.view().data_handle() == destination + offsets[i] * destination_stride &&
+        static_cast<int64_t>(source.stride()) == destination_stride) {
+      continue;
+    }
     raft::copy_matrix(destination + offsets[i] * destination_stride,
                       static_cast<std::size_t>(destination_stride),
                       source.view().data_handle(),
