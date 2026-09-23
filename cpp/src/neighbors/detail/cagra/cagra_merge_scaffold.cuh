@@ -14,6 +14,7 @@
 #include <raft/core/device_mdspan.hpp>
 #include <raft/core/error.hpp>
 #include <raft/core/resource/cuda_stream.hpp>
+#include <raft/core/resource/device_properties.hpp>
 #include <raft/core/resource/device_memory_resource.hpp>
 #include <raft/core/resources.hpp>
 #include <raft/util/cuda_rt_essentials.hpp>
@@ -27,6 +28,7 @@
 #include <cstdint>
 #include <limits>
 #include <utility>
+#include <type_traits>
 #include <vector>
 
 namespace cuvs::neighbors::cagra::detail::merge_scaffold {
@@ -52,6 +54,32 @@ inline auto strided_grid_size(int64_t items) -> int
 {
   return static_cast<int>(std::min<int64_t>(
     raft::div_rounding_up_safe<int64_t>(items, THREADS_PER_BLOCK), MAX_STRIDED_GRID_BLOCKS));
+}
+
+// Native byte GEMMs are validated on Hopper. Keep the established float path on
+// other architectures and when an int32 dot product could overflow.
+#ifndef FASTENER_INT8_ASSIGNMENT
+#define FASTENER_INT8_ASSIGNMENT 1
+#endif
+#ifndef FASTENER_INT8_LEAF
+#define FASTENER_INT8_LEAF 1
+#endif
+inline bool native_int8_gemm_supported(raft::resources const& res, int64_t dimension)
+{
+  return dimension > 0 && dimension <= std::numeric_limits<int32_t>::max() / 16384 &&
+         raft::resource::get_device_properties(res).major == 9;
+}
+
+template <typename OutT, typename T>
+__device__ OutT scaffold_value(T value)
+{
+  if constexpr (std::is_same_v<OutT, int8_t> && std::is_same_v<T, uint8_t>) {
+    // Translating every coordinate by -128 preserves squared L2 distances and
+    // maps the complete unsigned range losslessly into signed tensor-core input.
+    return static_cast<int8_t>(static_cast<int>(value) - 128);
+  } else {
+    return static_cast<OutT>(value);
+  }
 }
 
 // ----------------------------------------------------------------------------
@@ -97,6 +125,7 @@ struct split_context {
   /** Logical dimension of the dataset. The dataset view's extent(1) is its row pitch, which
    *  may exceed this when the consolidated dataset is padded for CAGRA row alignment. */
   int64_t logical_dim;
+  bool native_int8 = false;
   int assignment_tile_rows = ASSIGNMENT_TILE_ROWS;
   uint64_t seed            = DETERMINISTIC_SEED;
 };
@@ -165,6 +194,15 @@ CUVS_EXPORT void launch_materialize_tile_distances(raft::resources const& res,
                                                    uint32_t const* leader_ids,
                                                    partition_membership const* input_memberships,
                                                    assignment_tile const* tiles);
+CUVS_EXPORT void launch_materialize_tile_distances(raft::resources const& res,
+                                                   int32_t* dots,
+                                                   int batch_size,
+                                                   int tile_rows,
+                                                   int padded_leaders,
+                                                   float const* norms,
+                                                   uint32_t const* leader_ids,
+                                                   partition_membership const* input_memberships,
+                                                   assignment_tile const* tiles);
 CUVS_EXPORT void launch_emit_tile_assignments(raft::resources const& res,
                                               int const* selected_leaders,
                                               int batch_size,
@@ -193,6 +231,11 @@ CUVS_EXPORT void batched_row_dot_products(raft::resources const& res,
                                           long long out_stride,
                                           int row_width,
                                           int batch_count);
+CUVS_EXPORT void batched_row_dot_products(raft::resources const& res,
+                                          int8_t* a, int a_rows, long long a_stride,
+                                          int8_t* b, int b_rows, long long b_stride,
+                                          int32_t* out, long long out_stride,
+                                          int row_width, int batch_count);
 CUVS_EXPORT auto sort_memberships_and_collect_ranges(raft::resources const& res,
                                                      uint32_t* keys,
                                                      partition_membership* memberships,
@@ -207,6 +250,20 @@ CUVS_EXPORT void launch_initialize_self_scaffold(raft::resources const& res,
                                                  int64_t scaffold_degree);
 CUVS_EXPORT void launch_leaf_gram_knn(raft::resources const& res,
                                       float const* gram,
+                                      partition_membership const* memberships,
+                                      uint32_t const* origins,
+                                      uint32_t const* leaf_starts,
+                                      uint32_t const* leaf_counts,
+                                      uint32_t const* leaf_strides,
+                                      int64_t leaf_offset,
+                                      int64_t leaf_count,
+                                      int leaf_size,
+                                      int leaf_degree,
+                                      int64_t graph_degree,
+                                      int64_t scaffold_offset,
+                                      uint32_t* graph);
+CUVS_EXPORT void launch_leaf_gram_knn(raft::resources const& res,
+                                      int32_t const* gram,
                                       partition_membership const* memberships,
                                       uint32_t const* origins,
                                       uint32_t const* leaf_starts,
@@ -385,61 +442,63 @@ inline auto make_root_partition(raft::resources const& res, int64_t rows) -> par
   return root;
 }
 
-/** Copy the vectors of each tile row into a dense float buffer. Unused rows become zero. */
-template <typename T>
+/** Copy the vectors of each tile row into a dense scalar buffer. Unused rows become zero. */
+template <typename T, typename OutT>
 __global__ void manyway_gather_tile_points_kernel(T const* dataset,
                                                   int64_t dim,
                                                   int64_t row_stride,
+                                                  int64_t output_dim,
                                                   partition_membership const* memberships,
                                                   assignment_tile const* tiles,
                                                   int batch_size,
                                                   int tile_rows,
-                                                  float* output)
+                                                  OutT* output)
 {
   int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-  int64_t total  = static_cast<int64_t>(batch_size) * tile_rows * dim;
+  int64_t total  = static_cast<int64_t>(batch_size) * tile_rows * output_dim;
   for (; linear < total; linear += stride) {
-    int64_t d   = linear % dim;
-    int64_t row = (linear / dim) % tile_rows;
-    int batch   = static_cast<int>(linear / (dim * tile_rows));
+    int64_t d   = linear % output_dim;
+    int64_t row = (linear / output_dim) % tile_rows;
+    int batch   = static_cast<int>(linear / (output_dim * tile_rows));
     auto tile   = tiles[batch];
-    float value = 0.0f;
-    if (row < tile.rows) {
+    OutT value = 0;
+    if (row < tile.rows && d < dim) {
       uint32_t id = memberships[tile.input_start + row].id;
-      value       = static_cast<float>(dataset[static_cast<int64_t>(id) * row_stride + d]);
+      value       = scaffold_value<OutT>(dataset[static_cast<int64_t>(id) * row_stride + d]);
     }
     output[linear] = value;
   }
 }
 
-/** Copy the leader vectors of each tile into a dense float buffer and record the leader IDs. */
-template <typename T>
+/** Copy the leader vectors of each tile into a dense scalar buffer and record the leader IDs. */
+template <typename T, typename OutT>
 __global__ void manyway_gather_tile_leaders_kernel(T const* dataset,
                                                    int64_t dim,
                                                    int64_t row_stride,
+                                                  int64_t output_dim,
                                                    partition_membership const* memberships,
                                                    assignment_tile const* tiles,
                                                    int batch_size,
                                                    int padded_leaders,
-                                                   float* output,
+                                                   OutT* output,
                                                    uint32_t* leader_ids)
 {
   int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-  int64_t total  = static_cast<int64_t>(batch_size) * padded_leaders * dim;
+  int64_t total  = static_cast<int64_t>(batch_size) * padded_leaders * output_dim;
   for (; linear < total; linear += stride) {
-    int64_t d   = linear % dim;
-    int leader  = static_cast<int>((linear / dim) % padded_leaders);
-    int batch   = static_cast<int>(linear / (dim * padded_leaders));
+    int64_t d   = linear % output_dim;
+    int leader  = static_cast<int>((linear / output_dim) % padded_leaders);
+    int batch   = static_cast<int>(linear / (output_dim * padded_leaders));
     auto tile   = tiles[batch];
-    float value = 0.0f;
-    if (leader < tile.leader_count) {
+    OutT value = 0;
+    if (leader < tile.leader_count && d < dim) {
       int64_t relative = (tile.leader_offset +
                           (static_cast<int64_t>(leader) * tile.group_size) / tile.leader_count) %
                          tile.group_size;
       uint32_t id = memberships[tile.group_start + relative].id;
-      value       = static_cast<float>(dataset[static_cast<int64_t>(id) * row_stride + d]);
+      value       = scaffold_value<OutT>(dataset[static_cast<int64_t>(id) * row_stride + d]);
       if (d == 0) { leader_ids[static_cast<int64_t>(batch) * padded_leaders + leader] = id; }
     }
     output[linear] = value;
@@ -480,7 +539,8 @@ inline void carry_parents(raft::resources const& res,
 
 /** Workspace bytes `assign_bucket` needs for `capacity` tiles of `rows_per_tile` rows each */
 inline auto assignment_workspace_bytes(
-  size_t capacity, size_t rows_per_tile, size_t padded_leaders, size_t dim, size_t fanout) -> size_t
+  size_t capacity, size_t rows_per_tile, size_t padded_leaders, size_t dim, size_t fanout,
+  size_t vector_element_size = sizeof(float)) -> size_t
 {
   auto aligned = [](size_t bytes) { return rmm::align_up(bytes, rmm::CUDA_ALLOCATION_ALIGNMENT); };
   size_t point_elements    = rows_per_tile * dim;
@@ -488,8 +548,8 @@ inline auto assignment_workspace_bytes(
   size_t dot_elements      = rows_per_tile * padded_leaders;
   size_t selected_elements = rows_per_tile * fanout;
   return aligned(capacity * sizeof(assignment_tile)) +
-         aligned(capacity * point_elements * sizeof(float)) +
-         aligned(capacity * leader_elements * sizeof(float)) +
+         aligned(capacity * point_elements * vector_element_size) +
+         aligned(capacity * leader_elements * vector_element_size) +
          aligned(capacity * dot_elements * sizeof(float)) +
          aligned(capacity * padded_leaders * sizeof(uint32_t)) +
          aligned(capacity * selected_elements * sizeof(float)) +
@@ -523,11 +583,11 @@ inline auto assignment_gemm_supported(int64_t dimension,
  * Parents are cut into tiles of `assignment_tile_rows` rows; every tile in a bucket shares the
  * same padded leader count, so one strided batched GEMM per batch produces all point-leader dot
  * products. Tiles are processed in batches sized to the GEMM workspace: each batch gathers its
- * tile vectors and its parents' leader vectors into dense float buffers, converts dots to
+ * tile vectors and its parents' leader vectors into dense scalar buffers, converts dots to
  * distances with the precomputed row norms (|x|^2 + |l|^2 - 2 x.l), uses `select_k` to keep the
  * `fanout` nearest leaders per row, and writes the child keys and memberships.
  */
-template <typename T>
+template <typename T, typename MathT = float>
 void assign_bucket(raft::resources const& res,
                    raft::device_matrix_view<const T, int64_t, raft::row_major> dataset,
                    partition_set const& parents,
@@ -540,7 +600,12 @@ void assign_bucket(raft::resources const& res,
 {
   auto stream           = raft::resource::get_cuda_stream(res);
   auto const row_stride = dataset.extent(1);
-  auto dim              = context.logical_dim;
+  auto logical_dim      = context.logical_dim;
+  auto dim              = logical_dim;
+  if constexpr (std::is_same_v<MathT, int8_t>) {
+    dim = (dim + 3) / 4 * 4;
+    padded_leaders = std::max(4, padded_leaders);
+  }
   auto workspace_mr     = raft::resource::get_workspace_resource_ref(res);
   auto workspace_bytes  = raft::resource::get_workspace_free_bytes(res);
 
@@ -549,7 +614,7 @@ void assign_bucket(raft::resources const& res,
                                       rows_per_tile,
                                       static_cast<size_t>(padded_leaders),
                                       static_cast<size_t>(dim),
-                                      static_cast<size_t>(params.fanout));
+                                      static_cast<size_t>(params.fanout), sizeof(MathT));
   };
 
   // Preflight rejects any configuration whose widest leader matrix cannot host a single point row,
@@ -595,15 +660,16 @@ void assign_bucket(raft::resources const& res,
 
   auto device_tiles = raft::make_device_mdarray<assignment_tile, int64_t>(
     res, workspace_mr, raft::make_extents<int64_t>(static_cast<int64_t>(batch_capacity)));
-  auto tile_points = raft::make_device_mdarray<float, int64_t>(
+  auto tile_points = raft::make_device_mdarray<MathT, int64_t>(
     res,
     workspace_mr,
     raft::make_extents<int64_t>(static_cast<int64_t>(batch_capacity * point_elements)));
-  auto tile_leaders = raft::make_device_mdarray<float, int64_t>(
+  auto tile_leaders = raft::make_device_mdarray<MathT, int64_t>(
     res,
     workspace_mr,
     raft::make_extents<int64_t>(static_cast<int64_t>(batch_capacity * leader_elements)));
-  auto tile_dots = raft::make_device_mdarray<float, int64_t>(
+  using DotT = std::conditional_t<std::is_same_v<MathT, int8_t>, int32_t, float>;
+  auto tile_dots = raft::make_device_mdarray<DotT, int64_t>(
     res,
     workspace_mr,
     raft::make_extents<int64_t>(static_cast<int64_t>(batch_capacity * dot_elements)));
@@ -632,8 +698,9 @@ void assign_bucket(raft::resources const& res,
     int point_blocks = strided_grid_size(static_cast<int64_t>(batch_size * point_elements));
     manyway_gather_tile_points_kernel<<<point_blocks, THREADS_PER_BLOCK, 0, stream>>>(
       dataset.data_handle(),
-      dim,
+      logical_dim,
       row_stride,
+      dim,
       parents.memberships.data_handle(),
       device_tiles.data_handle(),
       static_cast<int>(batch_size),
@@ -644,8 +711,9 @@ void assign_bucket(raft::resources const& res,
     int leader_blocks = strided_grid_size(static_cast<int64_t>(batch_size * leader_elements));
     manyway_gather_tile_leaders_kernel<<<leader_blocks, THREADS_PER_BLOCK, 0, stream>>>(
       dataset.data_handle(),
-      dim,
+      logical_dim,
       row_stride,
+      dim,
       parents.memberships.data_handle(),
       device_tiles.data_handle(),
       static_cast<int>(batch_size),
@@ -680,7 +748,7 @@ void assign_bucket(raft::resources const& res,
                                       device_tiles.data_handle());
 
     select_nearest_leaders(res,
-                           tile_dots.data_handle(),
+                           reinterpret_cast<float*>(tile_dots.data_handle()),
                            selection_rows,
                            padded_leaders,
                            static_cast<int>(params.fanout),
@@ -735,6 +803,20 @@ auto split_manyway(raft::resources const& res,
   auto buckets = bucket_split_parents(plan, params);
   for (size_t bucket_index = 0; bucket_index < buckets.size(); ++bucket_index) {
     if (buckets[bucket_index].empty()) { continue; }
+    if constexpr (std::is_same_v<T, uint8_t> || std::is_same_v<T, int8_t>) {
+      if (context.native_int8) {
+        assign_bucket<T, int8_t>(res,
+                  dataset,
+                  parents,
+                  buckets[bucket_index],
+                  1 << bucket_index,
+                  params,
+                  context,
+                  keys,
+                  memberships);
+        continue;
+      }
+    }
     assign_bucket(res,
                   dataset,
                   parents,
@@ -850,7 +932,7 @@ inline auto make_leaves(raft::resources const& res,
 }
 
 /** Copy the vectors of each leaf into a dense buffer of OutT, zero-padding rows past the leaf
- *  end and dimensions past `input_dim`. Every scalar type is promoted to OutT (float) as-is. */
+ *  end and dimensions past `input_dim`. Byte-native gathers center uint8 values; other conversions preserve values. */
 template <typename T, typename OutT>
 __global__ void manyway_gather_leaf_vectors_kernel(T const* dataset,
                                                    int64_t input_dim,
@@ -879,14 +961,46 @@ __global__ void manyway_gather_leaf_vectors_kernel(T const* dataset,
       uint32_t point =
         memberships[leaf_starts[leaf] + local_row * static_cast<int64_t>(leaf_strides[leaf])].id;
       auto input = dataset[static_cast<int64_t>(point) * row_stride + d];
-      value      = static_cast<OutT>(input);
+      value      = scaffold_value<OutT>(input);
     }
     leaf_vectors[linear] = value;
   }
 }
 
-/** Build directed cross-input nearest neighbors for every leaf occurrence. */
+/** Four-byte native gather for aligned byte rows; XOR implements uint8 centering. */
 template <typename T>
+__global__ void manyway_gather_leaf_bytes4_kernel(T const* dataset,
+                                                 int64_t input_dim,
+                                                 int64_t row_stride,
+                                                 int64_t output_dim,
+                                                 int leaf_size,
+                                                 partition_membership const* memberships,
+                                                 uint32_t const* leaf_starts,
+                                                 uint32_t const* leaf_counts,
+                                                 uint32_t const* leaf_strides,
+                                                 int64_t leaf_offset,
+                                                 int64_t leaf_count,
+                                                 int8_t* output)
+{
+  auto words = output_dim / 4;
+  int64_t total = leaf_count * leaf_size * words;
+  for (int64_t linear = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+       linear < total; linear += int64_t(blockDim.x) * gridDim.x) {
+    int64_t d = linear % words;
+    int64_t row = (linear / words) % leaf_size;
+    int64_t leaf = leaf_offset + linear / (words * leaf_size);
+    uint32_t value = 0;
+    if (row < leaf_counts[leaf] && d < input_dim / 4) {
+      uint32_t point = memberships[leaf_starts[leaf] + row * leaf_strides[leaf]].id;
+      value = reinterpret_cast<uint32_t const*>(dataset)[int64_t(point) * (row_stride / 4) + d];
+      if constexpr (std::is_same_v<T, uint8_t>) { value ^= 0x80808080u; }
+    }
+    reinterpret_cast<uint32_t*>(output)[linear] = value;
+  }
+}
+
+/** Build directed cross-input nearest neighbors for every leaf occurrence. */
+template <typename T, typename MathT = float>
 auto build_leaf_neighbors(raft::resources const& res,
                           raft::device_matrix_view<const T, int64_t, raft::row_major> dataset,
                           int64_t logical_dim,
@@ -899,6 +1013,7 @@ auto build_leaf_neighbors(raft::resources const& res,
   auto stream             = raft::resource::get_cuda_stream(res);
   int64_t rows            = dataset.extent(0);
   int leaf_size           = static_cast<int>(params.leaf_size);
+  if constexpr (std::is_same_v<MathT, int8_t>) { leaf_size = (leaf_size + 3) / 4 * 4; }
   int leaf_degree         = static_cast<int>(params.leaf_degree);
   auto const& memberships = leaves.partitions->memberships;
 
@@ -910,17 +1025,19 @@ auto build_leaf_neighbors(raft::resources const& res,
   launch_initialize_self_scaffold(
     res, graph.data_handle(), rows, graph.extent(1), base_degree, union_degree);
 
-  // Gather every scalar type into float leaf buffers. Native INT8 cuBLAS is not portable across
-  // architectures (Ada returns CUBLAS_STATUS_NOT_SUPPORTED for the strided-batched INT8 path).
+  // Byte inputs use centered int8 vectors and int32 tensor-core dot products on
+  // supported devices. Pad dimensions/rows to the cuBLAS integer alignment.
+  // The fallback keeps the existing float buffers and TF32 GEMM.
   int64_t const row_stride        = dataset.extent(1);
   int64_t input_dimension         = logical_dim;
   int dimension                   = static_cast<int>(input_dimension);
+  if constexpr (std::is_same_v<MathT, int8_t>) { dimension = (dimension + 3) / 4 * 4; }
   size_t vector_elements_per_leaf = static_cast<size_t>(leaf_size) * dimension;
   size_t gram_elements_per_leaf   = static_cast<size_t>(leaf_size) * leaf_size;
   auto workspace_mr               = raft::resource::get_workspace_resource_ref(res);
   auto workspace_bytes            = raft::resource::get_workspace_free_bytes(res);
   auto leaf_workspace_bytes       = [&](size_t capacity) {
-    return rmm::align_up(capacity * vector_elements_per_leaf * sizeof(float),
+    return rmm::align_up(capacity * vector_elements_per_leaf * sizeof(MathT),
                          rmm::CUDA_ALLOCATION_ALIGNMENT) +
            rmm::align_up(capacity * gram_elements_per_leaf * sizeof(float),
                          rmm::CUDA_ALLOCATION_ALIGNMENT);
@@ -938,11 +1055,12 @@ auto build_leaf_neighbors(raft::resources const& res,
     }
   }
   size_t batch_capacity = min_batch_capacity;
-  auto leaf_vectors     = raft::make_device_mdarray<float, int64_t>(
+  auto leaf_vectors     = raft::make_device_mdarray<MathT, int64_t>(
     res,
     workspace_mr,
     raft::make_extents<int64_t>(static_cast<int64_t>(batch_capacity * vector_elements_per_leaf)));
-  auto gram = raft::make_device_mdarray<float, int64_t>(
+  using DotT = std::conditional_t<std::is_same_v<MathT, int8_t>, int32_t, float>;
+  auto gram = raft::make_device_mdarray<DotT, int64_t>(
     res,
     workspace_mr,
     raft::make_extents<int64_t>(static_cast<int64_t>(batch_capacity * gram_elements_per_leaf)));
@@ -954,19 +1072,27 @@ auto build_leaf_neighbors(raft::resources const& res,
     size_t batch_size = std::min(batch_capacity, leaves.starts_host.size() - leaf_offset);
     int gather_blocks =
       strided_grid_size(static_cast<int64_t>(batch_size * vector_elements_per_leaf));
-    manyway_gather_leaf_vectors_kernel<<<gather_blocks, THREADS_PER_BLOCK, 0, stream>>>(
-      dataset.data_handle(),
-      input_dimension,
-      row_stride,
-      input_dimension,
-      leaf_size,
-      memberships.data_handle(),
-      leaves.starts.data_handle(),
-      leaves.counts.data_handle(),
-      leaves.strides.data_handle(),
-      static_cast<int64_t>(leaf_offset),
-      static_cast<int64_t>(batch_size),
-      leaf_vectors.data_handle());
+    bool gathered = false;
+    if constexpr (std::is_same_v<MathT, int8_t>) {
+      if (input_dimension % 4 == 0 && row_stride % 4 == 0 &&
+          reinterpret_cast<uintptr_t>(dataset.data_handle()) % 4 == 0) {
+        auto blocks = strided_grid_size(
+          static_cast<int64_t>(batch_size * vector_elements_per_leaf / 4));
+        manyway_gather_leaf_bytes4_kernel<<<blocks, THREADS_PER_BLOCK, 0, stream>>>(
+          dataset.data_handle(), input_dimension, row_stride, dimension, leaf_size,
+          memberships.data_handle(), leaves.starts.data_handle(), leaves.counts.data_handle(),
+          leaves.strides.data_handle(), static_cast<int64_t>(leaf_offset),
+          static_cast<int64_t>(batch_size), leaf_vectors.data_handle());
+        gathered = true;
+      }
+    }
+    if (!gathered) {
+      manyway_gather_leaf_vectors_kernel<<<gather_blocks, THREADS_PER_BLOCK, 0, stream>>>(
+        dataset.data_handle(), input_dimension, row_stride, dimension, leaf_size,
+        memberships.data_handle(), leaves.starts.data_handle(), leaves.counts.data_handle(),
+        leaves.strides.data_handle(), static_cast<int64_t>(leaf_offset),
+        static_cast<int64_t>(batch_size), leaf_vectors.data_handle());
+    }
     RAFT_CUDA_TRY(cudaGetLastError());
     batched_row_dot_products(res,
                              leaf_vectors.data_handle(),
@@ -1006,7 +1132,7 @@ auto build_leaf_neighbors(raft::resources const& res,
  * This could be `raft::linalg::norm`, but half precision vectors might square to inf without a
  * wider accumulator.
  */
-template <typename T>
+template <typename T, bool Center = false>
 __global__ void manyway_l2_norms_kernel(
   T const* dataset, int64_t rows, int64_t dim, int64_t row_stride, float* norms)
 {
@@ -1020,6 +1146,7 @@ __global__ void manyway_l2_norms_kernel(
   T const* point = dataset + row * row_stride;
   for (int64_t d = lane; d < dim; d += raft::WarpSize) {
     float value = static_cast<float>(point[d]);
+    if constexpr (Center && std::is_same_v<T, uint8_t>) { value -= 128.0f; }
     sum         = fmaf(value, value, sum);
   }
   // Shuffle-reduce the partial sums; lane 0 holds the total.
@@ -1102,8 +1229,15 @@ auto build(raft::resources const& res,
 
   split_context context(res, rows, dim);
   int norm_blocks = static_cast<int>((rows + ROW_WARPS_PER_BLOCK - 1) / ROW_WARPS_PER_BLOCK);
-  manyway_l2_norms_kernel<<<norm_blocks, ROW_WARPS_PER_BLOCK * raft::WarpSize, 0, stream>>>(
-    dataset.data_handle(), rows, dim, dataset.extent(1), context.norms.data_handle());
+  context.native_int8 = FASTENER_INT8_ASSIGNMENT &&
+    (std::is_same_v<T, uint8_t> || std::is_same_v<T, int8_t>) && native_int8_gemm_supported(res, dim);
+  if (context.native_int8) {
+    manyway_l2_norms_kernel<T, true><<<norm_blocks, ROW_WARPS_PER_BLOCK * raft::WarpSize, 0, stream>>>(
+      dataset.data_handle(), rows, dim, dataset.extent(1), context.norms.data_handle());
+  } else {
+    manyway_l2_norms_kernel<<<norm_blocks, ROW_WARPS_PER_BLOCK * raft::WarpSize, 0, stream>>>(
+      dataset.data_handle(), rows, dim, dataset.extent(1), context.norms.data_handle());
+  }
   RAFT_CUDA_TRY(cudaGetLastError());
 
   // the actual splitting
@@ -1127,8 +1261,16 @@ auto build(raft::resources const& res,
 
   // Leaf construction: only range slicing occurs after configured geometric depth.
   auto leaves = make_leaves(res, partitions, params.leaf_size);
-  auto graph  = build_leaf_neighbors(
-    res, dataset, dim, leaves, origins.data_handle(), union_degree, base_degree, params);
+  auto graph = [&] {
+    if constexpr (FASTENER_INT8_LEAF && (std::is_same_v<T, uint8_t> || std::is_same_v<T, int8_t>)) {
+      if (native_int8_gemm_supported(res, dim)) {
+        return build_leaf_neighbors<T, int8_t>(
+          res, dataset, dim, leaves, origins.data_handle(), union_degree, base_degree, params);
+      }
+    }
+    return build_leaf_neighbors(
+      res, dataset, dim, leaves, origins.data_handle(), union_degree, base_degree, params);
+  }();
   raft::resource::sync_stream(res);
   return graph;
 }

@@ -9,6 +9,7 @@
 
 #include <raft/core/copy.hpp>
 #include <raft/core/resource/cuda_stream.hpp>
+#include <raft/core/resource/cublas_handle.hpp>
 #include <raft/core/resource/device_memory_resource.hpp>
 #include <raft/linalg/gemm.cuh>
 #include <raft/util/cuda_rt_essentials.hpp>
@@ -51,7 +52,40 @@ __global__ void carry_completed_parents_kernel(partition_membership const* input
   }
 }
 
-__global__ void materialize_tile_distances_kernel(float* dots,
+// One warp shares a query row. Hoist tile decoding and its norm out of the
+// leader loop, keeping adjacent lanes on adjacent int32 dot products.
+__global__ void materialize_int8_tile_distances_warp_kernel(int32_t* dots,
+                                                            int batch_size,
+                                                            int tile_rows,
+                                                            int padded_leaders,
+                                                            float const* norms,
+                                                            uint32_t const* leader_ids,
+                                                            partition_membership const* memberships,
+                                                            assignment_tile const* tiles)
+{
+  int lane = threadIdx.x % raft::WarpSize;
+  int64_t global_row = (int64_t(blockIdx.x) * blockDim.x + threadIdx.x) / raft::WarpSize;
+  int64_t row_stride = int64_t(blockDim.x) * gridDim.x / raft::WarpSize;
+  for (; global_row < int64_t(batch_size) * tile_rows; global_row += row_stride) {
+    int batch = static_cast<int>(global_row / tile_rows);
+    int row = static_cast<int>(global_row % tile_rows);
+    auto tile = tiles[batch];
+    float point_norm = 0.0f;
+    if (row < tile.rows) { point_norm = norms[memberships[tile.input_start + row].id]; }
+    for (int leader = lane; leader < padded_leaders; leader += raft::WarpSize) {
+      int64_t index = global_row * padded_leaders + leader;
+      float distance = std::numeric_limits<float>::infinity();
+      if (row < tile.rows && leader < tile.leader_count) {
+        auto id = leader_ids[int64_t(batch) * padded_leaders + leader];
+        distance = fmaxf(0.0f, point_norm + norms[id] - 2.0f * dots[index]);
+      }
+      reinterpret_cast<float*>(dots)[index] = distance;
+    }
+  }
+}
+
+template <typename DotT>
+__global__ void materialize_tile_distances_kernel(DotT* dots,
                                                   int batch_size,
                                                   int tile_rows,
                                                   int padded_leaders,
@@ -75,7 +109,7 @@ __global__ void materialize_tile_distances_kernel(float* dots,
         leader_ids[static_cast<int64_t>(batch) * padded_leaders + static_cast<int64_t>(leader)];
       distance = fmaxf(0.0f, norms[membership.id] + norms[leader_id] - 2.0f * dots[linear]);
     }
-    dots[linear] = distance;
+    reinterpret_cast<float*>(dots)[linear] = distance;
   }
 }
 
@@ -128,7 +162,8 @@ __global__ void initialize_self_scaffold_kernel(uint32_t* graph,
   }
 }
 
-__global__ void leaf_gram_knn_kernel(float const* gram,
+template <typename DotT>
+__global__ void leaf_gram_knn_kernel(DotT const* gram,
                                      partition_membership const* memberships,
                                      uint32_t const* origins,
                                      uint32_t const* leaf_starts,
@@ -330,6 +365,26 @@ void batched_row_dot_products(raft::resources const& res,
   raft::linalg::gemm_batched(res, a_view, b_view, out_view, alpha, beta, GEMM_COMPUTE_TYPE);
 }
 
+void batched_row_dot_products(raft::resources const& res,
+                              int8_t* a, int a_rows, long long a_stride,
+                              int8_t* b, int b_rows, long long b_stride,
+                              int32_t* out, long long out_stride,
+                              int row_width, int batch_count)
+{
+  auto handle = raft::resource::get_cublas_handle(res);
+  cublasPointerMode_t previous_mode;
+  RAFT_CUBLAS_TRY(cublasGetPointerMode(handle, &previous_mode));
+  RAFT_CUBLAS_TRY(cublasSetPointerMode(handle, CUBLAS_POINTER_MODE_HOST));
+  int32_t alpha = 1, beta = 0;
+  auto gemm_status = cublasGemmStridedBatchedEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+    a_rows, b_rows, row_width, &alpha, a, CUDA_R_8I, row_width, a_stride,
+    b, CUDA_R_8I, row_width, b_stride, &beta, out, CUDA_R_32I, a_rows, out_stride,
+    batch_count, CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT);
+  RAFT_CUBLAS_TRY(cublasSetPointerMode(handle, previous_mode));
+  RAFT_CUBLAS_TRY(gemm_status);
+
+}
+
 void launch_initialize_root_memberships(raft::resources const& res,
                                         partition_membership* memberships,
                                         int64_t rows)
@@ -369,6 +424,25 @@ void launch_materialize_tile_distances(raft::resources const& res,
 {
   auto blocks = strided_grid_size(static_cast<int64_t>(batch_size) * tile_rows * padded_leaders);
   materialize_tile_distances_kernel<<<blocks,
+                                      THREADS_PER_BLOCK,
+                                      0,
+                                      raft::resource::get_cuda_stream(res)>>>(
+    dots, batch_size, tile_rows, padded_leaders, norms, leader_ids, input_memberships, tiles);
+  RAFT_CUDA_TRY(cudaGetLastError());
+}
+
+void launch_materialize_tile_distances(raft::resources const& res,
+                                       int32_t* dots,
+                                       int batch_size,
+                                       int tile_rows,
+                                       int padded_leaders,
+                                       float const* norms,
+                                       uint32_t const* leader_ids,
+                                       partition_membership const* input_memberships,
+                                       assignment_tile const* tiles)
+{
+  auto blocks = strided_grid_size(static_cast<int64_t>(batch_size) * tile_rows * raft::WarpSize);
+  materialize_int8_tile_distances_warp_kernel<<<blocks,
                                       THREADS_PER_BLOCK,
                                       0,
                                       raft::resource::get_cuda_stream(res)>>>(
@@ -468,6 +542,40 @@ void launch_initialize_self_scaffold(raft::resources const& res,
 
 void launch_leaf_gram_knn(raft::resources const& res,
                           float const* gram,
+                          partition_membership const* memberships,
+                          uint32_t const* origins,
+                          uint32_t const* leaf_starts,
+                          uint32_t const* leaf_counts,
+                          uint32_t const* leaf_strides,
+                          int64_t leaf_offset,
+                          int64_t leaf_count,
+                          int leaf_size,
+                          int leaf_degree,
+                          int64_t graph_degree,
+                          int64_t scaffold_offset,
+                          uint32_t* graph)
+{
+  leaf_gram_knn_kernel<<<static_cast<int>(leaf_count),
+                         leaf_size,
+                         0,
+                         raft::resource::get_cuda_stream(res)>>>(gram,
+                                                                 memberships,
+                                                                 origins,
+                                                                 leaf_starts,
+                                                                 leaf_counts,
+                                                                 leaf_strides,
+                                                                 leaf_offset,
+                                                                 leaf_count,
+                                                                 leaf_size,
+                                                                 leaf_degree,
+                                                                 graph_degree,
+                                                                 scaffold_offset,
+                                                                 graph);
+  RAFT_CUDA_TRY(cudaGetLastError());
+}
+
+void launch_leaf_gram_knn(raft::resources const& res,
+                          int32_t const* gram,
                           partition_membership const* memberships,
                           uint32_t const* origins,
                           uint32_t const* leaf_starts,
